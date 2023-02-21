@@ -129,20 +129,36 @@ enum transmit_result {
     TRANSMIT_HARD_ERROR  /** Can't write (c->state is set to conn_closing) */
 };
 
+extern void increment_bypass_syscall(void);
+extern int shortcut_tcp_recvmsg(int fd, struct iovec *iov);
+extern int shortcut_tcp_sendmsg(int fd, struct iovec *iov);
+
 /* Default methods to read from/ write to a socket */
 ssize_t tcp_read(conn *c, void *buf, size_t count) {
+    struct iovec iov;
     assert (c != NULL);
-    return read(c->sfd, buf, count);
+    iov.iov_base = (void *)buf;
+    iov.iov_len  = count;
+    increment_bypass_syscall();
+    return shortcut_tcp_recvmsg(c->sfd, &iov);
+    //return read(c->sfd, buf, count);
 }
 
 ssize_t tcp_sendmsg(conn *c, struct msghdr *msg, int flags) {
     assert (c != NULL);
-    return sendmsg(c->sfd, msg, flags);
+    increment_bypass_syscall();
+    return shortcut_tcp_sendmsg(c->sfd, msg->msg_iov);
+    //return sendmsg(c->sfd, msg, flags);
 }
 
 ssize_t tcp_write(conn *c, void *buf, size_t count) {
+    struct iovec iov;
     assert (c != NULL);
-    return write(c->sfd, buf, count);
+    iov.iov_base = (void *)buf;
+    iov.iov_len  = count;
+    increment_bypass_syscall();
+    return shortcut_tcp_sendmsg(c->sfd, &iov);
+    //return write(c->sfd, buf, count);
 }
 
 static enum transmit_result transmit(conn *c);
