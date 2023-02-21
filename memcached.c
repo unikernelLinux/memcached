@@ -4680,6 +4680,9 @@ char arg13[] = "8192";
 
 char *myarr[13];
 
+extern void set_bypass_limit(int val);
+extern void set_bypass_syscall(int val);
+
 int main (int argc, char **argv) {
     
     myarr[0] = arg1;
@@ -4700,6 +4703,9 @@ int main (int argc, char **argv) {
 
     argc = 7;
     argv = myarr;
+
+    set_bypass_limit(10);
+    set_bypass_syscall(1);
 
     int c;
     bool lock_memory = false;
