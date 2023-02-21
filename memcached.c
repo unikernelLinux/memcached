@@ -4681,11 +4681,11 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
 char arg1[] = "memcached";
 char arg2[] = "-t";
 char arg3[] = "1";
+char arg4[] = "-B";
+char arg5[] = "binary";
+/*
 char arg4[] = "-m";
 char arg5[] = "32G";
-char arg6[] = "-B";
-char arg7[] = "binary";
-/*
 char arg6[] = "-l";
 char arg7[] = "192.168.19.37";
 char arg10[] = "-c";
@@ -4706,9 +4706,9 @@ int main (int argc, char **argv) {
     myarr[2] = arg3;
     myarr[3] = arg4;
     myarr[4] = arg5;
+    /*
     myarr[5] = arg6;
     myarr[6] = arg7;
-    /*
     myarr[7] = arg8;
     myarr[8] = arg9;
     myarr[9] = &arg10;
@@ -4717,7 +4717,7 @@ int main (int argc, char **argv) {
     myarr[12] = &arg13;
     */
 
-    argc = 7;
+    argc = 5;
     argv = myarr;
 
     set_bypass_limit(10);
