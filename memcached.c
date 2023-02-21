@@ -4662,15 +4662,53 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
     return reuse_mmap;
 }
 
+char arg1[] = "memcached";
+char arg2[] = "-t";
+char arg3[] = "1";
+char arg4[] = "-m";
+char arg5[] = "32G";
+char arg6[] = "-B";
+char arg7[] = "binary";
+/*
+char arg6[] = "-l";
+char arg7[] = "192.168.19.37";
+char arg10[] = "-c";
+char arg11[] = "8192";
+char arg12[] = "-b";
+char arg13[] = "8192";
+*/
+
+char *myarr[13];
+
 int main (int argc, char **argv) {
+    
+    myarr[0] = arg1;
+    myarr[1] = arg2;
+    myarr[2] = arg3;
+    myarr[3] = arg4;
+    myarr[4] = arg5;
+    myarr[5] = arg6;
+    myarr[6] = arg7;
+    /*
+    myarr[7] = arg8;
+    myarr[8] = arg9;
+    myarr[9] = &arg10;
+    myarr[10] = &arg11;
+    myarr[11] = &arg12;
+    myarr[12] = &arg13;
+    */
+
+    argc = 7;
+    argv = myarr;
+
     int c;
     bool lock_memory = false;
     bool do_daemonize = false;
     bool preallocate = false;
     int maxcore = 0;
-    char *username = NULL;
+    // char *username = NULL;
     char *pid_file = NULL;
-    struct passwd *pw;
+    // struct passwd *pw;
     struct rlimit rlim;
     char *buf;
     char unit = '\0';
@@ -5028,7 +5066,7 @@ int main (int argc, char **argv) {
             }
             break;
         case 'u':
-            username = optarg;
+            // username = optarg;
             break;
         case 'P':
             pid_file = optarg;
@@ -5794,6 +5832,7 @@ int main (int argc, char **argv) {
     }
 
     /* lose root privileges if we have them */
+    /*
     if (getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
             fprintf(stderr, "can't run as root without the -u switch\n");
@@ -5804,12 +5843,12 @@ int main (int argc, char **argv) {
             exit(EX_NOUSER);
         }
         if (setgroups(0, NULL) < 0) {
-            /* setgroups may fail with EPERM, indicating we are already in a
+            / * setgroups may fail with EPERM, indicating we are already in a
              * minimally-privileged state. In that case we continue. For all
              * other failure codes we exit.
              *
              * Note that errno is stored here because fprintf may change it.
-             */
+             * /
             bool should_exit = errno != EPERM;
             fprintf(stderr, "failed to drop supplementary groups: %s\n",
                     strerror(errno));
@@ -5822,6 +5861,7 @@ int main (int argc, char **argv) {
             exit(EX_OSERR);
         }
     }
+    */
 
     /* Initialize Sasl if -S was specified */
     if (settings.sasl) {
