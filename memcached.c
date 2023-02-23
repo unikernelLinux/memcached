@@ -4667,10 +4667,10 @@ char arg2[] = "-t";
 char arg3[] = "4";
 char arg4[] = "-B";
 char arg5[] = "binary";
+char arg6[] = "-m";
+char arg7[] = "32G";
 
 /*
-char arg4[] = "-m";
-char arg5[] = "32G";
 char arg6[] = "-l";
 char arg7[] = "192.168.19.37";
 char arg10[] = "-c";
@@ -4688,9 +4688,9 @@ int main (int argc, char **argv) {
     myarr[2] = arg3;
     myarr[3] = arg4;
     myarr[4] = arg5;
-    /*
     myarr[5] = arg6;
     myarr[6] = arg7;
+    /*
     myarr[7] = arg8;
     myarr[8] = arg9;
     myarr[9] = &arg10;
@@ -4699,7 +4699,7 @@ int main (int argc, char **argv) {
     myarr[12] = &arg13;
     */
 
-    argc = 5;
+    argc = 7;
     argv = myarr;
 
     int c;
