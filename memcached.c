@@ -137,14 +137,12 @@ extern int shortcut_tcp_write(int fd, void *data, size_t len);
 /* Default methods to read from/ write to a socket */
 ssize_t tcp_read(conn *c, void *buf, size_t count) {
     assert (c != NULL);
-    increment_bypass_syscall();
     return shortcut_tcp_recvmsg(c->sfd, buf, count);
     //return read(c->sfd, buf, count);
 }
 
 ssize_t tcp_sendmsg(conn *c, struct msghdr *msg, int flags) {
     assert (c != NULL);
-    increment_bypass_syscall();
     return shortcut_tcp_sendmsg(c->sfd, msg->msg_iov);
     //return sendmsg(c->sfd, msg, flags);
 }
