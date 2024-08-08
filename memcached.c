@@ -130,17 +130,15 @@ enum transmit_result {
 };
 
 extern void increment_bypass_syscall(void);
-extern int shortcut_tcp_recvmsg(int fd, struct iovec *iov);
+extern int shortcut_tcp_recvmsg(int fd, void *buf, size_t len);
 extern int shortcut_tcp_sendmsg(int fd, struct iovec *iov);
+extern int shortcut_tcp_write(int fd, void *data, size_t len);
 
 /* Default methods to read from/ write to a socket */
 ssize_t tcp_read(conn *c, void *buf, size_t count) {
-    struct iovec iov;
     assert (c != NULL);
-    iov.iov_base = (void *)buf;
-    iov.iov_len  = count;
     increment_bypass_syscall();
-    return shortcut_tcp_recvmsg(c->sfd, &iov);
+    return shortcut_tcp_recvmsg(c->sfd, buf, count);
     //return read(c->sfd, buf, count);
 }
 
@@ -152,12 +150,8 @@ ssize_t tcp_sendmsg(conn *c, struct msghdr *msg, int flags) {
 }
 
 ssize_t tcp_write(conn *c, void *buf, size_t count) {
-    struct iovec iov;
     assert (c != NULL);
-    iov.iov_base = (void *)buf;
-    iov.iov_len  = count;
-    increment_bypass_syscall();
-    return shortcut_tcp_sendmsg(c->sfd, &iov);
+    return shortcut_tcp_write(c->sfd, buf, count);
     //return write(c->sfd, buf, count);
 }
 
