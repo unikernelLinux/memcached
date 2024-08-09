@@ -3477,22 +3477,35 @@ static int server_socket(const char *interface,
                          FILE *portnumber_file, bool ssl_enabled) {
     int sfd;
     struct linger ling = {0, 0};
-    struct addrinfo *ai;
+    struct addrinfo ai;
+    struct sockaddr_in addr;
     struct addrinfo *next;
-    struct addrinfo hints = { .ai_flags = AI_PASSIVE,
-                              .ai_family = AF_UNSPEC };
+    //struct addrinfo hints = { .ai_flags = AI_PASSIVE,
+                              //.ai_family = AF_UNSPEC };
     char port_buf[NI_MAXSERV];
-    int error;
+    int error = 0;
     int success = 0;
     int flags =1;
 
-    hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
+    //hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
 
     if (port == -1) {
         port = 0;
     }
     snprintf(port_buf, sizeof(port_buf), "%d", port);
-    error= getaddrinfo(interface, port_buf, &hints, &ai);
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    ai.ai_family = AF_INET;
+    ai.ai_socktype = SOCK_STREAM;
+    ai.ai_protocol = 0;
+    ai.ai_addrlen = sizeof(addr);
+    ai.ai_addr = (struct sockaddr *)&addr;
+    ai.ai_canonname = NULL;
+    ai.ai_next = NULL;
+
+    //error= getaddrinfo(interface, port_buf, &hints, &ai);
     if (error != 0) {
         if (error != EAI_SYSTEM)
           fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
@@ -3501,7 +3514,7 @@ static int server_socket(const char *interface,
         return 1;
     }
 
-    for (next= ai; next; next= next->ai_next) {
+    for (next= &ai; next; next= next->ai_next) {
         conn *listen_conn_add;
         if ((sfd = new_socket(next)) == -1) {
             /* getaddrinfo can return "junk" addresses,
@@ -3557,7 +3570,7 @@ static int server_socket(const char *interface,
             if (errno != EADDRINUSE) {
                 perror("bind()");
                 close(sfd);
-                freeaddrinfo(ai);
+                //freeaddrinfo(ai);
                 return 1;
             }
             close(sfd);
@@ -3567,7 +3580,7 @@ static int server_socket(const char *interface,
             if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
                 perror("listen()");
                 close(sfd);
-                freeaddrinfo(ai);
+                //freeaddrinfo(ai);
                 return 1;
             }
             if (portnumber_file != NULL &&
@@ -3635,7 +3648,7 @@ static int server_socket(const char *interface,
         }
     }
 
-    freeaddrinfo(ai);
+    //freeaddrinfo(ai);
 
     /* Return zero iff we detected no errors in starting up connections */
     return success == 0;
@@ -4712,8 +4725,8 @@ int main (int argc, char **argv) {
     argc = 7;
     argv = myarr;
 
-    set_bypass_limit(10);
-    set_bypass_syscall(1);
+    //set_bypass_limit(10);
+    //set_bypass_syscall(1);
 
     int c;
     bool lock_memory = false;
