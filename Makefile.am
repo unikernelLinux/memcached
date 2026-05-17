@@ -89,15 +89,16 @@ memcached_SOURCES += tls.c tls.h
 endif
 
 memcached_debug_SOURCES = $(memcached_SOURCES)
-memcached_CPPFLAGS = -DNDEBUG
-memcached_debug_LDADD = @PROFILER_LDFLAGS@
+memcached_CPPFLAGS = -DNDEBUG -I$(top_srcdir)/../libupcall
+memcached_debug_CPPFLAGS = -I$(top_srcdir)/../libupcall
+memcached_debug_LDADD = ../libupcall/libupcall.a @PROFILER_LDFLAGS@
 memcached_debug_CFLAGS = @PROFILER_FLAGS@
 
-memcached_LDADD =
+memcached_LDADD = ../libupcall/libupcall.a
 memcached_LDFLAGS =
 memcached_debug_LDFLAGS =
-memcached_DEPENDENCIES =
-memcached_debug_DEPENDENCIES =
+memcached_DEPENDENCIES = ../libupcall/libupcall.a
+memcached_debug_DEPENDENCIES = ../libupcall/libupcall.a
 CLEANFILES=
 
 if BUILD_LINUX_PRIVS

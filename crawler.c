@@ -137,7 +137,7 @@ static void lru_crawler_close_client(crawler_client_t *c) {
 
 static void lru_crawler_release_client(crawler_client_t *c) {
     //fprintf(stderr, "CRAWLER: Closing client\n");
-    redispatch_conn(c->c);
+    conn_worker_readd(c->c);
     c->c = NULL;
     free(c->buf);
     c->buf = NULL;

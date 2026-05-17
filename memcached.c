@@ -61,6 +61,8 @@
 #include <sys/sysctl.h>
 #endif
 
+#include "../libupcall/upcall.h"
+
 /*
  * forward declarations
  */
@@ -80,7 +82,6 @@ enum try_read_result {
 static int try_read_command_negotiate(conn *c);
 static int try_read_command_udp(conn *c);
 
-static enum try_read_result try_read_network(conn *c);
 static enum try_read_result try_read_udp(conn *c);
 
 static int start_conn_timeout_thread(void);
@@ -93,11 +94,16 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr);
 static void settings_init(void);
 
 /* event handling, network IO */
-static void event_handler(const evutil_socket_t fd, const short which, void *arg);
 static void conn_close(conn *c);
 static void conn_init(void);
-static bool update_event(conn *c, const int new_flags);
 static void complete_nread(conn *c);
+
+/* upcall I/O callbacks */
+static void upcall_read_cb(struct up_event *evt);
+static void upcall_nread_cb(struct up_event *evt);
+static void upcall_swallow_cb(struct up_event *evt);
+static void upcall_write_cb(struct up_event *evt);
+void _transmit_post(conn *c, ssize_t res);
 
 static void conn_free(conn *c);
 
@@ -115,7 +121,7 @@ conn **conns;
 void *ext_storage = NULL;
 #endif
 /** file scope variables **/
-static conn *listen_conn = NULL;
+conn *listen_conn = NULL;
 static int max_fds;
 static struct event_base *main_base;
 
@@ -125,6 +131,40 @@ enum transmit_result {
     TRANSMIT_SOFT_ERROR, /** Can't write any more right now. */
     TRANSMIT_HARD_ERROR  /** Can't write (c->state is set to conn_closing) */
 };
+
+int upfd = -1;
+
+void upcall_accept_cb(struct up_event *evt) {
+    int new_sfd = evt->result;
+    int listen_sfd = evt->fd;
+
+    /* Re-register before processing so the next connection isn't missed. */
+    add_accept(listen_sfd, upcall_accept_cb);
+
+    if (new_sfd < 0)
+        return;
+
+    if (settings.maxconns_fast && new_sfd >= settings.maxconns - 1) {
+        const char *str = "ERROR Too many open connections\r\n";
+        if (write(new_sfd, str, strlen(str)) == -1) {}
+        close(new_sfd);
+        return;
+    }
+
+    /* Find the listen conn to get transport/protocol/tag. */
+    conn *lc = NULL;
+    for (conn *c = listen_conn; c; c = c->next) {
+        if (c->sfd == listen_sfd) { lc = c; break; }
+    }
+    if (!lc) { close(new_sfd); return; }
+
+    conn *c = conn_new(new_sfd, conn_new_cmd, READ_BUFFER_CACHED,
+                       lc->transport, NULL, lc->tag, lc->protocol);
+    if (!c) { close(new_sfd); return; }
+    c->thread = worker_me;
+
+    drive_machine(c);
+}
 
 /* Default methods to read from/ write to a socket */
 ssize_t tcp_read(conn *c, void *buf, size_t count) {
@@ -327,7 +367,7 @@ static void *conn_timeout_thread(void *arg) {
                 continue;
 
             if ((current_time - c->last_cmd_time) > settings.idle_timeout) {
-                timeout_conn(c);
+                conn_close_idle(c);
             } else {
                 if (c->last_cmd_time < oldest_last_cmd)
                     oldest_last_cmd = c->last_cmd_time;
@@ -521,18 +561,7 @@ void conn_close_idle(conn *c) {
     }
 }
 
-static void _conn_event_readd(conn *c) {
-    c->ev_flags = EV_READ | EV_PERSIST;
-    event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
-    event_base_set(c->thread->base, &c->event);
-
-    // TODO: call conn_cleanup/fail/etc
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-    }
-}
-
-/* bring conn back from a sidethread. could have had its event base moved. */
+/* bring conn back from a sidethread. */
 void conn_worker_readd(conn *c) {
     assert(c->resps_suspended == 0); // TODO: remove assert.
 
@@ -541,15 +570,10 @@ void conn_worker_readd(conn *c) {
             drive_machine(c);
             break;
         case conn_io_pending:
-            // The event listener was removed as more data showed up while
-            // waiting for the async response.
-            _conn_event_readd(c);
             // Explicit fall-through.
         case conn_io_queue:
             conn_set_state(c, conn_io_resume);
-            // schedule the event, which just runs drive_machine outside of
-            // any recursion here.
-            event_active(&c->event, 0, 0);
+            drive_machine(c);
             break;
         case conn_nread:
             // ran IO queue while waiting for set payload.
@@ -558,12 +582,10 @@ void conn_worker_readd(conn *c) {
         case conn_read:
         case conn_parse_cmd:
             // No-ops if we weren't in a suspended state to begin with
-            // TODO: which other states for this?
             break;
         default:
-            event_del(&c->event);
-            _conn_event_readd(c);
             conn_set_state(c, conn_new_cmd);
+            drive_machine(c);
     }
 
 }
@@ -608,9 +630,8 @@ void conn_io_queue_return(io_pending_t *io) {
 }
 
 conn *conn_new(const int sfd, enum conn_states init_state,
-                const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
-                struct event_base *base, void *ssl, uint64_t conntag,
+                void *ssl, uint64_t conntag,
                 enum protocol bproto) {
     conn *c;
 
@@ -766,15 +787,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
-
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-        return NULL;
-    }
-
     STATS_LOCK();
     stats_state.curr_conns++;
     stats.total_conns++;
@@ -869,9 +881,6 @@ static void conn_close(conn *c) {
                 &c->request_addr, c->request_addr_size, c->transport,
                 c->close_reason, c->sfd);
     }
-
-    /* delete the event, the socket and the conn */
-    event_del(&c->event);
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
@@ -2411,6 +2420,34 @@ static enum try_read_result try_read_udp(conn *c) {
     return READ_NO_DATA_RECEIVED;
 }
 
+static void alloc_read_buf(conn *c) {
+    assert(c != NULL);
+
+    if (c->rcurr != c->rbuf) {
+        if (c->rbytes > 0)
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+        c->rcurr = c->rbuf;
+    }
+
+    if (c->rbytes >= c->rsize && c->rbuf_malloced) {
+        char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
+        if (!new_rbuf) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            if (settings.verbose > 0) {
+                fprintf(stderr, "Couldn't realloc input buffer\n");
+            }
+            c->rbytes = 0;
+            out_of_memory(c, "SERVER_ERROR out of memory reading request");
+            c->close_after_write = true;
+            return;
+        }
+        c->rcurr = c->rbuf = new_rbuf;
+        c->rsize *= 2;
+    }
+}
+
 /*
  * read from network as much as we can, handle buffer overflow and connection
  * close.
@@ -2423,85 +2460,6 @@ static enum try_read_result try_read_udp(conn *c) {
  *
  * @return enum try_read_result
  */
-static enum try_read_result try_read_network(conn *c) {
-    enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
-    int res;
-    int num_allocs = 0;
-    assert(c != NULL);
-
-    if (c->rcurr != c->rbuf) {
-        if (c->rbytes > 0) /* otherwise there's nothing to copy */
-            memmove(c->rbuf, c->rcurr, c->rbytes);
-        c->rcurr = c->rbuf;
-    }
-
-    while (1) {
-        // TODO: move to rbuf_* func?
-        if (c->rbytes >= c->rsize && c->rbuf_malloced) {
-            if (num_allocs == 4) {
-                return gotdata;
-            }
-            ++num_allocs;
-            char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
-            if (!new_rbuf) {
-                STATS_LOCK();
-                stats.malloc_fails++;
-                STATS_UNLOCK();
-                if (settings.verbose > 0) {
-                    fprintf(stderr, "Couldn't realloc input buffer\n");
-                }
-                c->rbytes = 0; /* ignore what we read */
-                out_of_memory(c, "SERVER_ERROR out of memory reading request");
-                c->close_after_write = true;
-                return READ_MEMORY_ERROR;
-            }
-            c->rcurr = c->rbuf = new_rbuf;
-            c->rsize *= 2;
-        }
-
-        int avail = c->rsize - c->rbytes;
-        res = c->read(c, c->rbuf + c->rbytes, avail);
-        if (res > 0) {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.bytes_read += res;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
-            gotdata = READ_DATA_RECEIVED;
-            c->rbytes += res;
-            if (res == avail && c->rbuf_malloced) {
-                // Resize rbuf and try a few times if huge ascii multiget.
-                continue;
-            } else {
-                break;
-            }
-        }
-        if (res == 0) {
-            c->close_reason = NORMAL_CLOSE;
-            return READ_ERROR;
-        }
-        if (res == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            return READ_ERROR;
-        }
-    }
-    return gotdata;
-}
-
-static bool update_event(conn *c, const int new_flags) {
-    assert(c != NULL);
-
-    struct event_base *base = c->event.ev_base;
-    if (c->ev_flags == new_flags)
-        return true;
-    if (event_del(&c->event) == -1) return false;
-    event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = new_flags;
-    if (event_add(&c->event, 0) == -1) return false;
-    return true;
-}
-
 /*
  * Sets whether we are listening for new connections or not.
  */
@@ -2510,13 +2468,10 @@ void do_accept_new_conns(const bool do_accept) {
 
     for (next = listen_conn; next; next = next->next) {
         if (do_accept) {
-            update_event(next, EV_READ | EV_PERSIST);
             if (listen(next->sfd, settings.backlog) != 0) {
                 perror("listen");
             }
-        }
-        else {
-            update_event(next, 0);
+        } else {
             if (listen(next->sfd, 0) != 0) {
                 perror("listen");
             }
@@ -2536,7 +2491,7 @@ void do_accept_new_conns(const bool do_accept) {
         STATS_UNLOCK();
     } else {
         STATS_LOCK();
-        stats_state.accepting_conns = false;
+        //stats_state.accepting_conns = false;
         gettimeofday(&stats.maxconns_entered,NULL);
         stats.listen_disabled_num++;
         STATS_UNLOCK();
@@ -2616,7 +2571,7 @@ static int _transmit_pre(conn *c, struct iovec *iovs, int iovused, bool one_resp
  * Decrements and completes responses based on how much data was transmitted.
  * Takes the connection and current result bytes.
  */
-static void _transmit_post(conn *c, ssize_t res) {
+void _transmit_post(conn *c, ssize_t res) {
     // We've written some of the data. Remove the completed
     // responses from the list of pending writes.
     mc_resp *resp = c->resp_head;
@@ -2713,12 +2668,8 @@ static enum transmit_result transmit(conn *c) {
     }
 
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
-            conn_set_state(c, conn_closing);
-            return TRANSMIT_HARD_ERROR;
-        }
+        /* Register write interest with upcall; callback will resume. */
+        add_write(c->sfd, iovs[0].iov_base, iovs[0].iov_len, upcall_write_cb);
         return TRANSMIT_SOFT_ERROR;
     }
     /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
@@ -2852,12 +2803,7 @@ static enum transmit_result transmit_udp(conn *c) {
     }
 
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
-            conn_set_state(c, conn_closing);
-            return TRANSMIT_HARD_ERROR;
-        }
+        add_write(c->sfd, iovs[0].iov_base, iovs[0].iov_len, upcall_write_cb);
         return TRANSMIT_SOFT_ERROR;
     }
     /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
@@ -2865,7 +2811,7 @@ static enum transmit_result transmit_udp(conn *c) {
     if (settings.verbose > 0)
         perror("Failed to write, and not due to blocking");
 
-    conn_set_state(c, conn_read);
+    conn_set_state(c, conn_closing);
     return TRANSMIT_HARD_ERROR;
 }
 
@@ -2953,19 +2899,90 @@ static int read_into_chunked_item(conn *c) {
     return total;
 }
 
+static void upcall_read_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c) return;
+
+    if (evt->result <= 0) {
+        if (evt->result == 0)
+            c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    int n = evt->result;
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.bytes_read += n;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    memcpy(c->rbuf + c->rbytes, evt->buf, n);
+    c->rbytes += n;
+    return_buffer(evt->buf, evt->len);
+
+    conn_set_state(c, conn_parse_cmd);
+    drive_machine(c);
+}
+
+static void upcall_nread_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c) return;
+
+    if (evt->result <= 0) {
+        if (evt->result == 0)
+            c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    int n = evt->result;
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.bytes_read += n;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    memcpy(c->ritem, evt->buf, n);
+    c->ritem += n;
+    c->rlbytes -= n;
+    return_buffer(evt->buf, evt->len);
+
+    drive_machine(c);
+}
+
+static void upcall_swallow_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c) return;
+
+    if (evt->result <= 0) {
+        if (evt->result == 0)
+            c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    int n = evt->result;
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.bytes_read += n;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    c->sbytes -= n;
+    return_buffer(evt->buf, evt->len);
+
+    drive_machine(c);
+}
+
+static void upcall_write_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c) return;
+
+    _transmit_post(c, evt->result);
+    drive_machine(c);
+}
+
 static void drive_machine(conn *c) {
     bool stop = false;
-    int sfd;
-    socklen_t addrlen;
-    struct sockaddr_storage addr;
     int nreqs = settings.reqs_per_event;
-    int res;
-    const char *str;
-#ifdef HAVE_ACCEPT4
-    static int  use_accept4 = 1;
-#else
-    static int  use_accept4 = 0;
-#endif
 
     assert(c != NULL);
 
@@ -2973,117 +2990,24 @@ static void drive_machine(conn *c) {
 
         switch(c->state) {
         case conn_listening:
-            addrlen = sizeof(addr);
-#ifdef HAVE_ACCEPT4
-            if (use_accept4) {
-                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
-            } else {
-                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-            }
-#else
-            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-#endif
-            if (sfd == -1) {
-                if (use_accept4 && errno == ENOSYS) {
-                    use_accept4 = 0;
-                    continue;
-                }
-                perror(use_accept4 ? "accept4()" : "accept()");
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* these are transient, so don't log anything */
-                    stop = true;
-                } else if (errno == EMFILE) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Too many open connections\n");
-                    accept_new_conns(false);
-                    stop = true;
-                } else {
-                    perror("accept()");
-                    stop = true;
-                }
-                break;
-            }
-            if (!use_accept4) {
-                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
-                    perror("setting O_NONBLOCK");
-                    close(sfd);
-                    break;
-                }
-            }
-
-            bool reject;
-            if (settings.maxconns_fast) {
-                reject = sfd >= settings.maxconns - 1;
-                if (reject) {
-                    STATS_LOCK();
-                    stats.rejected_conns++;
-                    STATS_UNLOCK();
-                }
-            } else {
-                reject = false;
-            }
-
-            if (reject) {
-                str = "ERROR Too many open connections\r\n";
-                res = write(sfd, str, strlen(str));
-                close(sfd);
-            } else {
-                // run accept routine if ssl is compiled + enabled
-                bool fail = false;
-                void *ssl_v = ssl_accept(c, sfd, &fail);
-                if (fail) {
-                    close(sfd);
-                    break;
-                }
-
-                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
-            }
-
+            /* Accepts handled by upcall_accept_cb; this state is unused. */
             stop = true;
             break;
 
         case conn_waiting:
-            rbuf_release(c);
-            if (!update_event(c, EV_READ | EV_PERSIST)) {
-                if (settings.verbose > 0)
-                    fprintf(stderr, "Couldn't update event\n");
+            if (!rbuf_alloc(c)) {
                 conn_set_state(c, conn_closing);
                 break;
             }
-
+            alloc_read_buf(c);
+            add_read(c->sfd, upcall_read_cb);
             conn_set_state(c, conn_read);
             stop = true;
             break;
 
         case conn_read:
-            if (!IS_UDP(c->transport)) {
-                // Assign a read buffer if necessary.
-                if (!rbuf_alloc(c)) {
-                    // TODO: Some way to allow for temporary failures.
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
-                res = try_read_network(c);
-            } else {
-                // UDP connections always have a static buffer.
-                res = try_read_udp(c);
-            }
-
-            switch (res) {
-            case READ_NO_DATA_RECEIVED:
-                conn_set_state(c, conn_waiting);
-                break;
-            case READ_DATA_RECEIVED:
-                conn_set_state(c, conn_parse_cmd);
-                break;
-            case READ_ERROR:
-                conn_set_state(c, conn_closing);
-                break;
-            case READ_MEMORY_ERROR: /* Failed to allocate more memory */
-                /* State already set by try_read_network */
-                break;
-            }
+            /* Data delivered by upcall_read_cb into rbuf; proceed to parse. */
+            conn_set_state(c, conn_parse_cmd);
             break;
 
         case conn_parse_cmd:
@@ -3114,20 +3038,11 @@ static void drive_machine(conn *c) {
                 c->thread->stats.conn_yields++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
                 if (c->rbytes > 0) {
-                    /* We have already read in data into the input buffer,
-                       so libevent will most likely not signal read events
-                       on the socket (unless more data is available. As a
-                       hack we should just put in a request to write data,
-                       because that should be possible ;-)
-                    */
-                    if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-                        if (settings.verbose > 0)
-                            fprintf(stderr, "Couldn't update event\n");
-                        conn_set_state(c, conn_closing);
-                        break;
-                    }
+                    /* Buffered data; reset quota and keep processing. */
+                    nreqs = settings.reqs_per_event;
+                } else {
+                    stop = true;
                 }
-                stop = true;
             }
             break;
 
@@ -3137,7 +3052,6 @@ static void drive_machine(conn *c) {
                 break;
             }
 
-            /* Check if rbytes < 0, to prevent crash */
             if (c->rlbytes < 0) {
                 if (settings.verbose) {
                     fprintf(stderr, "Invalid rlbytes to read: len %d\n", c->rlbytes);
@@ -3146,83 +3060,31 @@ static void drive_machine(conn *c) {
                 break;
             }
 
-            if (c->item_malloced || ((((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) ) {
-                /* first check if we have leftovers in the conn_read buffer */
-                if (c->rbytes > 0) {
-                    int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
-                    memmove(c->ritem, c->rcurr, tocopy);
-                    c->ritem += tocopy;
-                    c->rlbytes -= tocopy;
-                    c->rcurr += tocopy;
-                    c->rbytes -= tocopy;
-                    if (c->rlbytes == 0) {
-                        break;
-                    }
-                }
-
-                /*  now try reading from the socket */
-                res = c->read(c, c->ritem, c->rlbytes);
-                if (res > 0) {
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.bytes_read += res;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-                    if (c->rcurr == c->ritem) {
-                        c->rcurr += res;
-                    }
-                    c->ritem += res;
-                    c->rlbytes -= res;
-                    break;
-                }
-            } else {
-                res = read_into_chunked_item(c);
-                if (res > 0)
+            /* Drain any leftover bytes from rbuf first. */
+            if (c->rbytes > 0 &&
+                (c->item_malloced || ((((item *)c->item)->it_flags & ITEM_CHUNKED) == 0))) {
+                int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
+                memmove(c->ritem, c->rcurr, tocopy);
+                c->ritem += tocopy;
+                c->rlbytes -= tocopy;
+                c->rcurr += tocopy;
+                c->rbytes -= tocopy;
+                if (c->rlbytes == 0)
                     break;
             }
 
-            if (res == 0) { /* end of stream */
-                c->close_reason = NORMAL_CLOSE;
-                conn_set_state(c, conn_closing);
-                break;
-            }
-
-            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
-                stop = true;
-                break;
-            }
-
-            /* Memory allocation failure */
-            if (res == -2) {
-                out_of_memory(c, "SERVER_ERROR Out of memory during read");
-                c->sbytes = c->rlbytes;
-                conn_set_state(c, conn_swallow);
-                break;
-            }
-            /* otherwise we have a real error, on which we close the connection */
-            if (settings.verbose > 0) {
-                fprintf(stderr, "Failed to read, and not due to blocking:\n"
-                        "errno: %d %s \n"
-                        "rcurr=%p ritem=%p rbuf=%p rlbytes=%d rsize=%d\n",
-                        errno, strerror(errno),
-                        (void *)c->rcurr, (void *)c->ritem, (void *)c->rbuf,
-                        (int)c->rlbytes, (int)c->rsize);
-            }
-            conn_set_state(c, conn_closing);
+            /* Wait for more data from upcall. */
+            add_read(c->sfd, upcall_nread_cb);
+            stop = true;
             break;
 
         case conn_swallow:
-            /* we are reading sbytes and throwing them away */
             if (c->sbytes <= 0) {
                 conn_set_state(c, conn_new_cmd);
                 break;
             }
 
-            /* first check if we have leftovers in the conn_read buffer */
+            /* Drain leftovers from rbuf first. */
             if (c->rbytes > 0) {
                 int tocopy = c->rbytes > c->sbytes ? c->sbytes : c->rbytes;
                 c->sbytes -= tocopy;
@@ -3231,34 +3093,9 @@ static void drive_machine(conn *c) {
                 break;
             }
 
-            /*  now try reading from the socket */
-            res = c->read(c, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
-            if (res > 0) {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.bytes_read += res;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                c->sbytes -= res;
-                break;
-            }
-            if (res == 0) { /* end of stream */
-                c->close_reason = NORMAL_CLOSE;
-                conn_set_state(c, conn_closing);
-                break;
-            }
-            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
-                stop = true;
-                break;
-            }
-            /* otherwise we have a real error, on which we close the connection */
-            if (settings.verbose > 0)
-                fprintf(stderr, "Failed to read, and not due to blocking\n");
-            conn_set_state(c, conn_closing);
+            /* Wait for more data from upcall. */
+            add_read(c->sfd, upcall_swallow_cb);
+            stop = true;
             break;
 
         case conn_write:
@@ -3327,8 +3164,6 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
         case conn_io_queue:
-            /* Woke up while waiting for an async return, but not ready. */
-            event_del(&c->event);
             conn_set_state(c, conn_io_pending);
             stop = true;
             break;
@@ -3346,28 +3181,6 @@ static void drive_machine(conn *c) {
         }
     }
 
-    return;
-}
-
-void event_handler(const evutil_socket_t fd, const short which, void *arg) {
-    conn *c;
-
-    c = (conn *)arg;
-    assert(c != NULL);
-
-    c->which = which;
-
-    /* sanity */
-    if (fd != c->sfd) {
-        if (settings.verbose > 0)
-            fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
-        conn_close(c);
-        return;
-    }
-
-    drive_machine(c);
-
-    /* wait for next event */
     return;
 }
 
@@ -3566,36 +3379,9 @@ static int server_socket(const char *interface,
             }
         }
 
-        if (IS_UDP(transport)) {
-            int c;
-
-            for (c = 0; c < settings.num_threads_per_udp; c++) {
-                /* Allocate one UDP file descriptor per worker thread;
-                 * this allows "stats conns" to separately list multiple
-                 * parallel UDP requests in progress.
-                 *
-                 * The dispatch code round-robins new connection requests
-                 * among threads, so this is guaranteed to assign one
-                 * FD to each thread.
-                 */
-                int per_thread_fd;
-                if (c == 0) {
-                    per_thread_fd = sfd;
-                } else {
-                    per_thread_fd = dup(sfd);
-                    if (per_thread_fd < 0) {
-                        perror("Failed to duplicate file descriptor");
-                        exit(EXIT_FAILURE);
-                    }
-                }
-                dispatch_conn_new(per_thread_fd, conn_read,
-                                  EV_READ | EV_PERSIST,
-                                  UDP_READ_BUFFER_SIZE, transport, NULL, conntag, bproto);
-            }
-        } else {
+        if (!IS_UDP(transport)) {
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
-                                             EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL, conntag, bproto))) {
+                                             1, transport, NULL, conntag, bproto))) {
                 fprintf(stderr, "failed to create listening connection\n");
                 exit(EXIT_FAILURE);
             }
@@ -3868,8 +3654,7 @@ static int server_socket_unix(const char *path, int access_mask) {
         return 1;
     }
     if (!(listen_conn = conn_new(sfd, conn_listening,
-                                 EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL, 0, settings.binding_protocol))) {
+                                 1, local_transport, NULL, 0, settings.binding_protocol))) {
         fprintf(stderr, "failed to create listening connection\n");
         exit(EXIT_FAILURE);
     }
@@ -6005,6 +5790,11 @@ int main (int argc, char **argv) {
         settings.proxy_ctx = proxy_init(settings.proxy_uring, settings.proxy_memprofile);
     }
 #endif
+    upfd = upcall_create(UPCALL_PCACHE);
+    if (upfd < 0) {
+        perror("upcall_create failed");
+        exit(EX_OSERR);
+    }
 #ifdef EXTSTORE
     memcached_thread_init(settings.num_threads, storage);
     init_lru_crawler(storage);
@@ -6153,6 +5943,9 @@ int main (int argc, char **argv) {
         if (temp_portnumber_filename)
             free(temp_portnumber_filename);
     }
+
+    /* Release workers to register accept callbacks and enter event loop. */
+    upcall_workers_go();
 
     /* Give the sockets a moment to open. I know this is dumb, but the error
      * is only an advisory.
