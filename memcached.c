@@ -6180,6 +6180,7 @@ int main (int argc, char **argv) {
     /* Initialize the uriencode lookup table. */
     uriencode_init();
 
+    fprintf(stderr, "!! MEMCACHED READY !!\n");
     /* enter the event loop */
     while (!stop_main_loop) {
         if (event_base_loop(main_base, EVLOOP_ONCE) != 0) {
