@@ -351,115 +351,62 @@ fi
 dnl Check if data pointer is 64bit or not
 AC_CHECK_SIZEOF([void *])
 
-# Issue 213: Search for clock_gettime to help people linking
-#            with a static version of libevent
 AC_SEARCH_LIBS(clock_gettime, rt)
-# Issue 214: Search for the network libraries _before_ searching
-#            for libevent (to help people linking with static libevent)
 AC_SEARCH_LIBS(socket, socket)
 AC_SEARCH_LIBS(gethostbyname, nsl)
 
-trylibeventdir=""
-AC_ARG_WITH(libevent,
-       [  --with-libevent=PATH     Specify path to libevent installation ],
+dnl ------------------------------------------------------
+dnl libupcall detection.
+
+trylibupcalldir=""
+AC_ARG_WITH(libupcall,
+       [  --with-libupcall=PATH    Specify path to libupcall installation ],
        [
                 if test "x$withval" != "xno" ; then
-                        trylibeventdir=$withval
+                        trylibupcalldir=$withval
                 fi
        ]
 )
 
-dnl ------------------------------------------------------
-dnl libevent detection.  swiped from Tor.  modified a bit.
-
-LIBEVENT_URL=https://www.monkey.org/~provos/libevent/
-
-AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
+AC_CACHE_CHECK([for libupcall directory], ac_cv_libupcall_dir, [
   saved_LIBS="$LIBS"
   saved_LDFLAGS="$LDFLAGS"
   saved_CPPFLAGS="$CPPFLAGS"
-  le_found=no
-  for ledir in $trylibeventdir "" $prefix /usr/local ; do
+  lu_found=no
+  for ludir in $trylibupcalldir ../../libupcall ; do
     LDFLAGS="$saved_LDFLAGS"
-    LIBS="-levent $saved_LIBS"
 
-    # Skip the directory if it isn't there.
-    if test ! -z "$ledir" -a ! -d "$ledir" ; then
+    if test ! -z "$ludir" -a ! -d "$ludir" ; then
        continue;
     fi
-    if test ! -z "$ledir" ; then
-      if test -d "$ledir/lib" ; then
-        LDFLAGS="-L$ledir/lib $LDFLAGS"
-      else
-        LDFLAGS="-L$ledir $LDFLAGS"
-      fi
-      if test -d "$ledir/include" ; then
-        CPPFLAGS="-I$ledir/include $CPPFLAGS"
-      else
-        CPPFLAGS="-I$ledir $CPPFLAGS"
-      fi
+    ludir_abs=$(cd "$ludir" && pwd)
+    if test -f "$ludir_abs/libupcall.a" ; then
+      LIBS="-lupcall $saved_LIBS"
+    else
+      continue
     fi
-    # Can I compile and link it?
-    AC_TRY_LINK([#include <sys/time.h>
-#include <sys/types.h>
-#include <event.h>], [ event_init(); ],
-       [ libevent_linked=yes ], [ libevent_linked=no ])
-    if test $libevent_linked = yes; then
-       if test ! -z "$ledir" ; then
-         ac_cv_libevent_dir=$ledir
-         _myos=`echo $target_os | cut -f 1 -d .`
-         AS_IF(test "$SUNCC" = "yes" -o "x$_myos" = "xsolaris2",
-               [saved_LDFLAGS="$saved_LDFLAGS -Wl,-R$ledir/lib"],
-               [AS_IF(test "$GCC" = "yes",
-                     [saved_LDFLAGS="$saved_LDFLAGS -Wl,-rpath,$ledir/lib"])])
-       else
-         ac_cv_libevent_dir="(system)"
-       fi
-       le_found=yes
+    LDFLAGS="-L$ludir_abs $saved_LDFLAGS"
+    CPPFLAGS="-I$ludir_abs $saved_CPPFLAGS"
+
+    AC_TRY_LINK([#include <stdint.h>
+#include "upcall.h"],
+       [ upcall_create(0); ],
+       [ lu_found=yes; ac_cv_libupcall_dir=$ludir_abs ],
+       [ lu_found=no ])
+    if test $lu_found = yes; then
        break
     fi
   done
   LIBS="$saved_LIBS"
   LDFLAGS="$saved_LDFLAGS"
   CPPFLAGS="$saved_CPPFLAGS"
-  if test $le_found = no ; then
-    AC_MSG_ERROR([libevent is required.  You can get it from $LIBEVENT_URL
-
-      If it's already installed, specify its path using --with-libevent=/dir/
-])
+  if test $lu_found = no ; then
+    AC_MSG_ERROR([libupcall is required. Specify its path using --with-libupcall=/dir/])
   fi
 ])
-LIBS="-levent $LIBS"
-if test $ac_cv_libevent_dir != "(system)"; then
-  if test -d "$ac_cv_libevent_dir/lib" ; then
-    LDFLAGS="-L$ac_cv_libevent_dir/lib $LDFLAGS"
-    le_libdir="$ac_cv_libevent_dir/lib"
-  else
-    LDFLAGS="-L$ac_cv_libevent_dir $LDFLAGS"
-    le_libdir="$ac_cv_libevent_dir"
-  fi
-  if test -d "$ac_cv_libevent_dir/include" ; then
-    CPPFLAGS="-I$ac_cv_libevent_dir/include $CPPFLAGS"
-  else
-    CPPFLAGS="-I$ac_cv_libevent_dir $CPPFLAGS"
-  fi
-fi
-
-AC_RUN_IFELSE(
-   [AC_LANG_PROGRAM([
-#include <event.h>
-   ], [dnl
-const char *ver = event_get_version();
-return (ver != NULL && *ver != '1') ? 0 : 1;
-   ])
-   ],[
-     AC_DEFINE(HAVE_LIBEVENT_NEW, 1, [linked to libevent])
-   ],
-   [
-     AC_MSG_ERROR([libevent2 is required])
-   ],
-   []
-[])
+LIBS="-lupcall $LIBS"
+LDFLAGS="-L$ac_cv_libupcall_dir $LDFLAGS"
+CPPFLAGS="-I$ac_cv_libupcall_dir $CPPFLAGS"
 
 trylibssldir=""
 AC_ARG_WITH(libssl,

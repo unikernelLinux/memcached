@@ -93,10 +93,8 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr);
 static void settings_init(void);
 
 /* event handling, network IO */
-static void event_handler(const evutil_socket_t fd, const short which, void *arg);
 static void conn_close(conn *c);
 static void conn_init(void);
-static bool update_event(conn *c, const int new_flags);
 static void complete_nread(conn *c);
 
 static void conn_free(conn *c);
@@ -115,9 +113,11 @@ conn **conns;
 void *ext_storage = NULL;
 #endif
 /** file scope variables **/
-static conn *listen_conn = NULL;
+conn *listen_conn = NULL;
 static int max_fds;
-static struct event_base *main_base;
+int upfd;
+int clock_tfd;
+int maxconns_tfd = -1;
 
 enum transmit_result {
     TRANSMIT_COMPLETE,   /** All done writing. */
@@ -151,17 +151,12 @@ static enum transmit_result transmit(conn *c);
  */
 static volatile bool allow_new_conns = true;
 static int stop_main_loop = NOT_STOP;
-static struct event maxconnsevent;
-static void maxconns_handler(const evutil_socket_t fd, const short which, void *arg) {
-    struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
-
-    if (fd == -42 || allow_new_conns == false) {
-        /* reschedule in 10ms if we need to keep polling */
-        evtimer_set(&maxconnsevent, maxconns_handler, 0);
-        event_base_set(main_base, &maxconnsevent);
-        evtimer_add(&maxconnsevent, &t);
-    } else {
-        evtimer_del(&maxconnsevent);
+void upcall_maxconns_cb(struct up_event *evt) {
+    uint64_t buf;
+    read(evt->fd, &buf, sizeof(buf));
+    if (allow_new_conns) {
+        struct itimerspec ts = {0};
+        timerfd_settime(maxconns_tfd, 0, &ts, NULL);
         accept_new_conns(true);
     }
 }
@@ -231,7 +226,6 @@ static void settings_init(void) {
     settings.factor = 1.25;
     settings.chunk_size = 48;         /* space for a modest key and value */
     settings.num_threads = 4;         /* N workers */
-    settings.num_threads_per_udp = 0;
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
     settings.reqs_per_event = 20;
@@ -273,7 +267,6 @@ static void settings_init(void) {
 #ifdef MEMCACHED_DEBUG
     settings.relaxed_privileges = false;
 #endif
-    settings.num_napi_ids = 0;
     settings.memory_file = NULL;
 #ifdef SOCK_COOKIE_ID
     settings.sock_cookie_id = 0;
@@ -521,49 +514,31 @@ void conn_close_idle(conn *c) {
     }
 }
 
-static void _conn_event_readd(conn *c) {
-    c->ev_flags = EV_READ | EV_PERSIST;
-    event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
-    event_base_set(c->thread->base, &c->event);
-
-    // TODO: call conn_cleanup/fail/etc
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-    }
-}
-
-/* bring conn back from a sidethread. could have had its event base moved. */
+/* bring conn back from a sidethread. */
 void conn_worker_readd(conn *c) {
-    assert(c->resps_suspended == 0); // TODO: remove assert.
+    assert(c->resps_suspended == 0);
 
     switch (c->state) {
         case conn_closing:
             drive_machine(c);
             break;
         case conn_io_pending:
-            // The event listener was removed as more data showed up while
-            // waiting for the async response.
-            _conn_event_readd(c);
-            // Explicit fall-through.
+            /* re-register for reading since more data may have arrived */
+            add_read(c->sfd, IS_UDP(c->transport) ? upcall_udp_read_cb : upcall_read_cb);
+            /* fall-through */
         case conn_io_queue:
             conn_set_state(c, conn_io_resume);
-            // schedule the event, which just runs drive_machine outside of
-            // any recursion here.
-            event_active(&c->event, 0, 0);
+            drive_machine(c);
             break;
         case conn_nread:
-            // ran IO queue while waiting for set payload.
         case conn_write:
         case conn_mwrite:
         case conn_read:
         case conn_parse_cmd:
-            // No-ops if we weren't in a suspended state to begin with
-            // TODO: which other states for this?
             break;
         default:
-            event_del(&c->event);
-            _conn_event_readd(c);
             conn_set_state(c, conn_new_cmd);
+            drive_machine(c);
     }
 
 }
@@ -608,9 +583,8 @@ void conn_io_queue_return(io_pending_t *io) {
 }
 
 conn *conn_new(const int sfd, enum conn_states init_state,
-                const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
-                struct event_base *base, void *ssl, uint64_t conntag,
+                void *ssl, uint64_t conntag,
                 enum protocol bproto) {
     conn *c;
 
@@ -766,15 +740,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
-
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-        return NULL;
-    }
-
     STATS_LOCK();
     stats_state.curr_conns++;
     stats.total_conns++;
@@ -869,9 +834,6 @@ static void conn_close(conn *c) {
                 &c->request_addr, c->request_addr_size, c->transport,
                 c->close_reason, c->sfd);
     }
-
-    /* delete the event, the socket and the conn */
-    event_del(&c->event);
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
@@ -1763,7 +1725,7 @@ void server_stats(ADD_STAT add_stats, void *c) {
     APPEND_STAT("uptime", "%u", now - ITEM_UPDATE_INTERVAL);
     APPEND_STAT("time", "%ld", now + (long)process_started);
     APPEND_STAT("version", "%s", VERSION);
-    APPEND_STAT("libevent", "%s", event_get_version());
+    APPEND_STAT("libevent", "%s", "upcall");
     APPEND_STAT("pointer_size", "%d", (int)(8 * sizeof(void *)));
 
 #ifndef WIN32
@@ -1789,7 +1751,6 @@ void server_stats(ADD_STAT add_stats, void *c) {
     APPEND_STAT("read_buf_bytes", "%llu", (unsigned long long)thread_stats.read_buf_bytes);
     APPEND_STAT("read_buf_bytes_free", "%llu", (unsigned long long)thread_stats.read_buf_bytes_free);
     APPEND_STAT("read_buf_oom", "%llu", (unsigned long long)thread_stats.read_buf_oom);
-    APPEND_STAT("reserved_fds", "%u", stats_state.reserved_fds);
 #ifdef PROXY
     if (settings.proxy_enabled) {
         APPEND_STAT("proxy_conn_requests", "%llu", (unsigned long long)thread_stats.proxy_conn_requests);
@@ -1893,8 +1854,6 @@ void server_stats(ADD_STAT add_stats, void *c) {
         APPEND_STAT("time_since_server_cert_refresh", "%u", now - settings.ssl_last_cert_refresh_time);
     }
 #endif
-    APPEND_STAT("unexpected_napi_ids", "%llu", (unsigned long long)stats.unexpected_napi_ids);
-    APPEND_STAT("round_robin_fallback", "%llu", (unsigned long long)stats.round_robin_fallback);
 }
 
 void process_stat_settings(ADD_STAT add_stats, void *c) {
@@ -1915,7 +1874,6 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("growth_factor", "%.2f", settings.factor);
     APPEND_STAT("chunk_size", "%d", settings.chunk_size);
     APPEND_STAT("num_threads", "%d", settings.num_threads);
-    APPEND_STAT("num_threads_per_udp", "%d", settings.num_threads_per_udp);
     APPEND_STAT("stat_key_prefix", "%c", settings.prefix_delimiter);
     APPEND_STAT("detail_enabled", "%s",
                 settings.detail_enabled ? "yes" : "no");
@@ -1988,7 +1946,6 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("proxy_enabled", "%s", settings.proxy_enabled ? "yes" : "no");
     APPEND_STAT("proxy_uring_enabled", "%s", settings.proxy_uring ? "yes" : "no");
 #endif
-    APPEND_STAT("num_napi_ids", "%d", settings.num_napi_ids);
     APPEND_STAT("memory_file", "%s", settings.memory_file);
     APPEND_STAT("client_flags_size", "%d", sizeof(client_flags_t));
 }
@@ -2493,20 +2450,6 @@ static enum try_read_result try_read_network(conn *c) {
     return gotdata;
 }
 
-static bool update_event(conn *c, const int new_flags) {
-    assert(c != NULL);
-
-    struct event_base *base = c->event.ev_base;
-    if (c->ev_flags == new_flags)
-        return true;
-    if (event_del(&c->event) == -1) return false;
-    event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = new_flags;
-    if (event_add(&c->event, 0) == -1) return false;
-    return true;
-}
-
 /*
  * Sets whether we are listening for new connections or not.
  */
@@ -2515,13 +2458,10 @@ void do_accept_new_conns(const bool do_accept) {
 
     for (next = listen_conn; next; next = next->next) {
         if (do_accept) {
-            update_event(next, EV_READ | EV_PERSIST);
             if (listen(next->sfd, settings.backlog) != 0) {
                 perror("listen");
             }
-        }
-        else {
-            update_event(next, 0);
+        } else {
             if (listen(next->sfd, 0) != 0) {
                 perror("listen");
             }
@@ -2546,7 +2486,13 @@ void do_accept_new_conns(const bool do_accept) {
         stats.listen_disabled_num++;
         STATS_UNLOCK();
         allow_new_conns = false;
-        maxconns_handler(-42, 0, 0);
+        if (maxconns_tfd >= 0) {
+            struct itimerspec ts = {
+                .it_interval = {.tv_sec = 0, .tv_nsec = 10000000},
+                .it_value    = {.tv_sec = 0, .tv_nsec = 10000000},
+            };
+            timerfd_settime(maxconns_tfd, 0, &ts, NULL);
+        }
     }
 }
 
@@ -2718,12 +2664,21 @@ static enum transmit_result transmit(conn *c) {
     }
 
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
+        /* Flatten pending iovecs into a contiguous buffer for add_write */
+        size_t total = 0;
+        for (int i = 0; i < iovused; i++)
+            total += iovs[i].iov_len;
+        c->upcall_wbuf = malloc(total);
+        if (!c->upcall_wbuf) {
             conn_set_state(c, conn_closing);
             return TRANSMIT_HARD_ERROR;
         }
+        char *p = c->upcall_wbuf;
+        for (int i = 0; i < iovused; i++) {
+            memcpy(p, iovs[i].iov_base, iovs[i].iov_len);
+            p += iovs[i].iov_len;
+        }
+        add_write(c->sfd, c->upcall_wbuf, total, upcall_write_cb);
         return TRANSMIT_SOFT_ERROR;
     }
     /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
@@ -2857,13 +2812,9 @@ static enum transmit_result transmit_udp(conn *c) {
     }
 
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
-            conn_set_state(c, conn_closing);
-            return TRANSMIT_HARD_ERROR;
-        }
-        return TRANSMIT_SOFT_ERROR;
+        /* UDP is lossy; drop the response and wait for next datagram */
+        conn_set_state(c, conn_read);
+        return TRANSMIT_HARD_ERROR;
     }
     /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
        we have a real error, on which we close the connection */
@@ -2960,104 +2911,17 @@ static int read_into_chunked_item(conn *c) {
 
 static void drive_machine(conn *c) {
     bool stop = false;
-    int sfd;
-    socklen_t addrlen;
-    struct sockaddr_storage addr;
     int nreqs = settings.reqs_per_event;
     int res;
-    const char *str;
-#ifdef HAVE_ACCEPT4
-    static int  use_accept4 = 1;
-#else
-    static int  use_accept4 = 0;
-#endif
 
     assert(c != NULL);
 
     while (!stop) {
 
         switch(c->state) {
-        case conn_listening:
-            addrlen = sizeof(addr);
-#ifdef HAVE_ACCEPT4
-            if (use_accept4) {
-                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
-            } else {
-                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-            }
-#else
-            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-#endif
-            if (sfd == -1) {
-                if (use_accept4 && errno == ENOSYS) {
-                    use_accept4 = 0;
-                    continue;
-                }
-                perror(use_accept4 ? "accept4()" : "accept()");
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* these are transient, so don't log anything */
-                    stop = true;
-                } else if (errno == EMFILE) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Too many open connections\n");
-                    accept_new_conns(false);
-                    stop = true;
-                } else {
-                    perror("accept()");
-                    stop = true;
-                }
-                break;
-            }
-            if (!use_accept4) {
-                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
-                    perror("setting O_NONBLOCK");
-                    close(sfd);
-                    break;
-                }
-            }
-
-            bool reject;
-            if (settings.maxconns_fast) {
-                reject = sfd >= settings.maxconns - 1;
-                if (reject) {
-                    STATS_LOCK();
-                    stats.rejected_conns++;
-                    STATS_UNLOCK();
-                }
-            } else {
-                reject = false;
-            }
-
-            if (reject) {
-                str = "ERROR Too many open connections\r\n";
-                res = write(sfd, str, strlen(str));
-                close(sfd);
-            } else {
-                // run accept routine if ssl is compiled + enabled
-                bool fail = false;
-                void *ssl_v = ssl_accept(c, sfd, &fail);
-                if (fail) {
-                    close(sfd);
-                    break;
-                }
-
-                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
-            }
-
-            stop = true;
-            break;
-
         case conn_waiting:
             rbuf_release(c);
-            if (!update_event(c, EV_READ | EV_PERSIST)) {
-                if (settings.verbose > 0)
-                    fprintf(stderr, "Couldn't update event\n");
-                conn_set_state(c, conn_closing);
-                break;
-            }
-
-            conn_set_state(c, conn_read);
+            add_read(c->sfd, IS_UDP(c->transport) ? upcall_udp_read_cb : upcall_read_cb);
             stop = true;
             break;
 
@@ -3119,18 +2983,9 @@ static void drive_machine(conn *c) {
                 c->thread->stats.conn_yields++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
                 if (c->rbytes > 0) {
-                    /* We have already read in data into the input buffer,
-                       so libevent will most likely not signal read events
-                       on the socket (unless more data is available. As a
-                       hack we should just put in a request to write data,
-                       because that should be possible ;-)
-                    */
-                    if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-                        if (settings.verbose > 0)
-                            fprintf(stderr, "Couldn't update event\n");
-                        conn_set_state(c, conn_closing);
-                        break;
-                    }
+                    /* buffered data remains; reset quota and keep processing */
+                    nreqs = settings.reqs_per_event;
+                    break;
                 }
                 stop = true;
             }
@@ -3191,12 +3046,7 @@ static void drive_machine(conn *c) {
             }
 
             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
+                add_read(c->sfd, upcall_nread_cb);
                 stop = true;
                 break;
             }
@@ -3251,12 +3101,7 @@ static void drive_machine(conn *c) {
                 break;
             }
             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
+                add_read(c->sfd, upcall_swallow_cb);
                 stop = true;
                 break;
             }
@@ -3333,7 +3178,6 @@ static void drive_machine(conn *c) {
             break;
         case conn_io_queue:
             /* Woke up while waiting for an async return, but not ready. */
-            event_del(&c->event);
             conn_set_state(c, conn_io_pending);
             stop = true;
             break;
@@ -3354,27 +3198,6 @@ static void drive_machine(conn *c) {
     return;
 }
 
-void event_handler(const evutil_socket_t fd, const short which, void *arg) {
-    conn *c;
-
-    c = (conn *)arg;
-    assert(c != NULL);
-
-    c->which = which;
-
-    /* sanity */
-    if (fd != c->sfd) {
-        if (settings.verbose > 0)
-            fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
-        conn_close(c);
-        return;
-    }
-
-    drive_machine(c);
-
-    /* wait for next event */
-    return;
-}
 
 static int new_socket(struct addrinfo *ai) {
     int sfd;
@@ -3487,15 +3310,6 @@ static int server_socket(const char *interface,
             continue;
         }
 
-        if (settings.num_napi_ids) {
-            socklen_t len = sizeof(socklen_t);
-            int napi_id;
-            error = getsockopt(sfd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napi_id, &len);
-            if (error != 0) {
-                fprintf(stderr, "-N <num_napi_ids> option not supported\n");
-                exit(EXIT_FAILURE);
-            }
-        }
 
 #ifdef IPV6_V6ONLY
         if (next->ai_family == AF_INET6) {
@@ -3572,35 +3386,12 @@ static int server_socket(const char *interface,
         }
 
         if (IS_UDP(transport)) {
-            int c;
-
-            for (c = 0; c < settings.num_threads_per_udp; c++) {
-                /* Allocate one UDP file descriptor per worker thread;
-                 * this allows "stats conns" to separately list multiple
-                 * parallel UDP requests in progress.
-                 *
-                 * The dispatch code round-robins new connection requests
-                 * among threads, so this is guaranteed to assign one
-                 * FD to each thread.
-                 */
-                int per_thread_fd;
-                if (c == 0) {
-                    per_thread_fd = sfd;
-                } else {
-                    per_thread_fd = dup(sfd);
-                    if (per_thread_fd < 0) {
-                        perror("Failed to duplicate file descriptor");
-                        exit(EXIT_FAILURE);
-                    }
-                }
-                dispatch_conn_new(per_thread_fd, conn_read,
-                                  EV_READ | EV_PERSIST,
-                                  UDP_READ_BUFFER_SIZE, transport, NULL, conntag, bproto);
-            }
+            dispatch_conn_new(sfd, conn_read,
+                              UDP_READ_BUFFER_SIZE, transport, NULL, conntag, bproto);
         } else {
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
-                                             EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL, conntag, bproto))) {
+                                             1, transport,
+                                             NULL, conntag, bproto))) {
                 fprintf(stderr, "failed to create listening connection\n");
                 exit(EXIT_FAILURE);
             }
@@ -3873,8 +3664,8 @@ static int server_socket_unix(const char *path, int access_mask) {
         return 1;
     }
     if (!(listen_conn = conn_new(sfd, conn_listening,
-                                 EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL, 0, settings.binding_protocol))) {
+                                 1, local_transport,
+                                 NULL, 0, settings.binding_protocol))) {
         fprintf(stderr, "failed to create listening connection\n");
         exit(EXIT_FAILURE);
     }
@@ -3894,7 +3685,6 @@ static int server_socket_unix(const char *path, int access_mask) {
  * sizeof(time_t) > sizeof(unsigned int).
  */
 volatile rel_time_t current_time;
-static struct event clockevent;
 #ifdef MEMCACHED_DEBUG
 volatile bool is_paused;
 volatile int64_t delta;
@@ -3904,31 +3694,11 @@ static bool monotonic = false;
 static int64_t monotonic_start;
 #endif
 
-/* libevent uses a monotonic clock when available for event scheduling. Aside
- * from jitter, simply ticking our internal timer here is accurate enough.
- * Note that users who are setting explicit dates for expiration times *must*
- * ensure their clocks are correct before starting memcached. */
-static void clock_handler(const evutil_socket_t fd, const short which, void *arg) {
-    struct timeval t = {.tv_sec = 1, .tv_usec = 0};
-    static bool initialized = false;
-
-    if (initialized) {
-        /* only delete the event if it's actually there. */
-        evtimer_del(&clockevent);
-    } else {
-        initialized = true;
-    }
-
-    // While we're here, check for hash table expansion.
-    // This function should be quick to avoid delaying the timer.
+static void update_clock(void) {
     assoc_start_expand(stats_state.curr_items);
-    // also, if HUP'ed we need to do some maintenance.
-    // for now that's just the authfile and TLS certificates reload.
     if (settings.sig_hup) {
         settings.sig_hup = false;
-
         authfile_load(settings.auth_file);
-
 #ifdef TLS
         if (settings.ssl_ctx != NULL) {
             char *errmsg = NULL;
@@ -3939,17 +3709,12 @@ static void clock_handler(const evutil_socket_t fd, const short which, void *arg
             }
         }
 #endif
-
 #ifdef PROXY
         if (settings.proxy_ctx) {
             proxy_start_reload(settings.proxy_ctx);
         }
 #endif
     }
-
-    evtimer_set(&clockevent, clock_handler, 0);
-    event_base_set(main_base, &clockevent);
-    evtimer_add(&clockevent, &t);
 
 #ifdef MEMCACHED_DEBUG
     if (is_paused) return;
@@ -3977,6 +3742,223 @@ static void clock_handler(const evutil_socket_t fd, const short which, void *arg
         current_time = (rel_time_t) (tv.tv_sec - process_started);
 #endif
     }
+}
+
+void upcall_clock_cb(struct up_event *evt) {
+    uint64_t buf;
+    read(evt->fd, &buf, sizeof(buf));
+    update_clock();
+    add_read(evt->fd, upcall_clock_cb);
+}
+
+void upcall_accept_cb(struct up_event *evt) {
+    int sfd = evt->result;
+
+    add_accept(evt->fd, upcall_accept_cb);
+
+    if (sfd < 0)
+        return;
+
+    conn *lc = conns[evt->fd];
+
+    if (!allow_new_conns) {
+        close(sfd);
+        return;
+    }
+
+    if (settings.maxconns_fast && sfd >= settings.maxconns - 1) {
+        const char *str = "ERROR Too many open connections\r\n";
+        write(sfd, str, strlen(str));
+        close(sfd);
+        STATS_LOCK();
+        stats.rejected_conns++;
+        STATS_UNLOCK();
+        return;
+    }
+
+    bool fail = false;
+    void *ssl_v = ssl_accept(lc, sfd, &fail);
+    if (fail) {
+        close(sfd);
+        return;
+    }
+
+    dispatch_conn_new(sfd, conn_new_cmd, READ_BUFFER_CACHED,
+                      lc ? lc->transport : tcp_transport,
+                      ssl_v, lc ? lc->tag : 0,
+                      lc ? lc->protocol : settings.binding_protocol);
+}
+
+void upcall_read_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c)
+        return;
+
+    if (evt->result == 0) {
+        c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    if (evt->result < 0) {
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    /* Stage pool buffer data into rbuf */
+    if (!rbuf_alloc(c)) {
+        return_buffer(evt->buf, evt->len);
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    int avail = (c->rbuf + c->rsize) - (c->rcurr + c->rbytes);
+    if (avail < evt->result) {
+        /* not enough space; memmove to front first */
+        if (c->rcurr != c->rbuf) {
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+            c->rcurr = c->rbuf;
+        }
+        avail = c->rsize - c->rbytes;
+    }
+    int tocopy = evt->result < avail ? evt->result : avail;
+    memcpy(c->rcurr + c->rbytes, evt->buf, tocopy);
+    c->rbytes += tocopy;
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.bytes_read += tocopy;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    return_buffer(evt->buf, evt->len);
+
+    conn_set_state(c, conn_parse_cmd);
+    drive_machine(c);
+}
+
+void upcall_udp_read_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c)
+        return;
+
+    if (evt->result <= 0) {
+        return_buffer(evt->buf, evt->len);
+        return;
+    }
+
+    /* Copy pool buffer into static UDP read buffer; request_addr unavailable */
+    int tocopy = evt->result < c->rsize ? evt->result : c->rsize;
+    memcpy(c->rbuf, evt->buf, tocopy);
+    c->rbytes = tocopy;
+    c->rcurr = c->rbuf;
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.bytes_read += tocopy;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    return_buffer(evt->buf, evt->len);
+
+    conn_set_state(c, conn_parse_cmd);
+    drive_machine(c);
+}
+
+static void stage_to_rbuf(conn *c, void *buf, int len) {
+    char *dest = c->rcurr + c->rbytes;
+    if (dest + len > c->rbuf + c->rsize) {
+        memmove(c->rbuf, c->rcurr, c->rbytes);
+        c->rcurr = c->rbuf;
+        dest = c->rbuf + c->rbytes;
+    }
+    int avail = (c->rbuf + c->rsize) - dest;
+    if (len > avail) len = avail;
+    memcpy(dest, buf, len);
+    c->rbytes += len;
+}
+
+void upcall_nread_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c) {
+        return_buffer(evt->buf, evt->len);
+        return;
+    }
+
+    if (evt->result <= 0) {
+        return_buffer(evt->buf, evt->len);
+        c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    /* Stage in rbuf; conn_nread drains rbytes before reading from socket */
+    if (!rbuf_alloc(c)) {
+        return_buffer(evt->buf, evt->len);
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+    stage_to_rbuf(c, evt->buf, evt->result);
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.bytes_read += evt->result;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    return_buffer(evt->buf, evt->len);
+
+    conn_set_state(c, conn_nread);
+    drive_machine(c);
+}
+
+void upcall_swallow_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    if (!c) {
+        return_buffer(evt->buf, evt->len);
+        return;
+    }
+
+    if (evt->result <= 0) {
+        return_buffer(evt->buf, evt->len);
+        c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    /* Stage in rbuf; conn_swallow drains rbytes before reading from socket */
+    stage_to_rbuf(c, evt->buf, evt->result);
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.bytes_read += evt->result;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    return_buffer(evt->buf, evt->len);
+
+    conn_set_state(c, conn_swallow);
+    drive_machine(c);
+}
+
+void upcall_write_cb(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+
+    if (c && c->upcall_wbuf) {
+        free(c->upcall_wbuf);
+        c->upcall_wbuf = NULL;
+    }
+
+    if (!c)
+        return;
+
+    if (evt->result <= 0) {
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    /* Advance iovecs by bytes written, then continue drive_machine */
+    _transmit_post(c, evt->result);
+    drive_machine(c);
 }
 
 static const char* flag_enabled_disabled(bool flag) {
@@ -4160,7 +4142,6 @@ static void usage(void) {
             );
 #endif
     ssl_help();
-    printf("-N, --napi_ids            number of napi ids. see doc/napi_ids.txt for more details\n");
     return;
 }
 
@@ -4356,23 +4337,6 @@ static int enable_large_pages(void) {
 #endif
 }
 
-/**
- * Do basic sanity check of the runtime environment
- * @return true if no errors found, false if we can't use this env
- */
-static bool sanitycheck(void) {
-    /* One of our biggest problems is old and bogus libevents */
-    const char *ever = event_get_version();
-    if (ever != NULL) {
-        if (strncmp(ever, "1.", 2) == 0) {
-            fprintf(stderr, "You are using libevent %s.\nPlease upgrade to 2.x"
-                        " or newer\n", event_get_version());
-            return false;
-        }
-    }
-
-    return true;
-}
 
 static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
     char *b = NULL;
@@ -4854,11 +4818,6 @@ int main (int argc, char **argv) {
         NULL
     };
 
-    if (!sanitycheck()) {
-        free(meta);
-        return EX_OSERR;
-    }
-
     /* handle SIGINT, SIGTERM */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -4916,7 +4875,6 @@ int main (int argc, char **argv) {
           "Y:"   /* Enable token auth */
           "e:"  /* mmap path for external item memory */
           "o:"  /* Extended generic options */
-          "N:"  /* NAPI ID based thread selection */
           ;
 
     /* process arguments */
@@ -4957,7 +4915,6 @@ int main (int argc, char **argv) {
         {"auth-file", required_argument, 0, 'Y'},
         {"memory-file", required_argument, 0, 'e'},
         {"extended", required_argument, 0, 'o'},
-        {"napi-ids", required_argument, 0, 'N'},
         {0, 0, 0, 0}
     };
     int optindex;
@@ -5183,13 +5140,6 @@ int main (int argc, char **argv) {
        case 'Y' :
             // dupe the file path now just in case the options get mangled.
             settings.auth_file = strdup(optarg);
-            break;
-       case 'N':
-            settings.num_napi_ids = atoi(optarg);
-            if (settings.num_napi_ids <= 0) {
-                fprintf(stderr, "Maximum number of NAPI IDs must be greater than 0\n");
-                return 1;
-            }
             break;
         case 'o': /* It's sub-opts time! */
             subopts_orig = subopts = strdup(optarg); /* getsubopt() changes the original args */
@@ -5633,12 +5583,6 @@ int main (int argc, char **argv) {
         }
     }
 
-    if (settings.num_napi_ids > settings.num_threads) {
-        fprintf(stderr, "Number of napi_ids(%d) cannot be greater than number of threads(%d)\n",
-                settings.num_napi_ids, settings.num_threads);
-        exit(EX_USAGE);
-    }
-
     if (settings.item_size_max < ITEM_SIZE_MAX_LOWER_LIMIT) {
         fprintf(stderr, "Item max size cannot be less than 1024 bytes.\n");
         exit(EX_USAGE);
@@ -5721,16 +5665,6 @@ int main (int argc, char **argv) {
     if (hash_init(hash_type) != 0) {
         fprintf(stderr, "Failed to initialize hash_algorithm!\n");
         exit(EX_USAGE);
-    }
-
-    /*
-     * Use one workerthread to serve each UDP port if the user specified
-     * multiple ports
-     */
-    if (settings.inter != NULL && strchr(settings.inter, ',')) {
-        settings.num_threads_per_udp = 1;
-    } else {
-        settings.num_threads_per_udp = settings.num_threads;
     }
 
     if (settings.sasl) {
@@ -5884,18 +5818,18 @@ int main (int argc, char **argv) {
 #endif
     }
 
-    /* initialize main thread libevent instance */
-#if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
-    /* If libevent version is larger/equal to 2.0.2-alpha, use newer version */
-    struct event_config *ev_config;
-    ev_config = event_config_new();
-    event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
-    main_base = event_base_new_with_config(ev_config);
-    event_config_free(ev_config);
-#else
-    /* Otherwise, use older API */
-    main_base = event_init();
-#endif
+    /* initialize upcall event channel */
+    upfd = upcall_create(0);
+    if (upfd < 0) {
+        fprintf(stderr, "failed to create upcall fd: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    maxconns_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (maxconns_tfd < 0) {
+        perror("timerfd_create for maxconns");
+        exit(EXIT_FAILURE);
+    }
 
     /* Load initial auth file if required */
     if (settings.auth_file) {
@@ -6083,7 +6017,20 @@ int main (int argc, char **argv) {
         }
     }
 #endif
-    clock_handler(0, 0, 0);
+    /* set up clock timerfd (1-second interval) and do initial time update */
+    clock_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (clock_tfd < 0) {
+        perror("timerfd_create for clock");
+        exit(EXIT_FAILURE);
+    }
+    {
+        struct itimerspec ts = {
+            .it_interval = {.tv_sec = 1, .tv_nsec = 0},
+            .it_value    = {.tv_sec = 1, .tv_nsec = 0},
+        };
+        timerfd_settime(clock_tfd, 0, &ts, NULL);
+    }
+    update_clock();
 
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
@@ -6163,7 +6110,7 @@ int main (int argc, char **argv) {
      * is only an advisory.
      */
     usleep(1000);
-    if (stats_state.curr_conns + stats_state.reserved_fds >= settings.maxconns - 1) {
+    if (stats_state.curr_conns >= settings.maxconns - 1) {
         fprintf(stderr, "Maxconns setting is too low, use -c to increase.\n");
         exit(EXIT_FAILURE);
     }
@@ -6180,13 +6127,13 @@ int main (int argc, char **argv) {
     /* Initialize the uriencode lookup table. */
     uriencode_init();
 
-    /* enter the event loop */
-    while (!stop_main_loop) {
-        if (event_base_loop(main_base, EVLOOP_ONCE) != 0) {
-            retval = EXIT_FAILURE;
-            break;
-        }
-    }
+    /* release workers to register listen/clock fds and enter event loop */
+    upcall_workers_go();
+    fprintf(stderr, "!! MEMCACHED READY !!\n");
+
+    /* main thread waits for stop signal */
+    while (!stop_main_loop)
+        pause();
 
     switch (stop_main_loop) {
         case GRACE_STOP:
@@ -6219,9 +6166,6 @@ int main (int argc, char **argv) {
     /* Clean up strdup() call for bind() address */
     if (settings.inter)
       free(settings.inter);
-
-    /* cleanup base */
-    event_base_free(main_base);
 
     free(meta);
 

@@ -42,7 +42,6 @@ typedef struct conn_queue_item CQ_ITEM;
 struct conn_queue_item {
     int               sfd;
     enum conn_states  init_state;
-    int               event_flags;
     int               read_buffer_size;
     enum network_transport     transport;
     enum conn_queue_item_modes mode;
@@ -85,10 +84,7 @@ static unsigned int item_lock_hashpower;
 #define hashsize(n) ((unsigned long int)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
-/*
- * Each libevent instance has a wakeup pipe, which other threads
- * can use to signal that they've put a new connection on its queue.
- */
+/* Worker thread array; other threads signal via ctrl_fd eventfd. */
 static LIBEVENT_THREAD *threads;
 
 /*
@@ -102,9 +98,6 @@ static void notify_worker(LIBEVENT_THREAD *t, CQ_ITEM *item);
 static void notify_worker_fd(LIBEVENT_THREAD *t, int sfd, enum conn_queue_item_modes mode);
 static CQ_ITEM *cqi_new(CQ *cq);
 static void cq_push(CQ *cq, CQ_ITEM *item);
-
-static void thread_libevent_process(evutil_socket_t fd, short which, void *arg);
-static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg);
 
 /* item_lock() must be held for an item before any modifications to either its
  * associated hash bucket, or the structure itself.
@@ -335,19 +328,10 @@ static void cqi_free(CQ *cq, CQ_ITEM *item) {
 // much that will transfer from a synthetic benchmark.
 static void notify_worker(LIBEVENT_THREAD *t, CQ_ITEM *item) {
     cq_push(t->ev_queue, item);
-#ifdef HAVE_EVENTFD
     uint64_t u = 1;
-    if (write(t->n.notify_event_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
-        perror("failed writing to worker eventfd");
-        /* TODO: This is a fatal problem. Can it ever happen temporarily? */
+    if (write(t->ctrl_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        perror("failed writing to worker ctrl eventfd");
     }
-#else
-    char buf[1] = "c";
-    if (write(t->n.notify_send_fd, buf, 1) != 1) {
-        perror("Failed writing to notify pipe");
-        /* TODO: This is a fatal problem. Can it ever happen temporarily? */
-    }
-#endif
 }
 
 // NOTE: An external func that takes a conn *c might be cleaner overall.
@@ -395,47 +379,24 @@ void accept_new_conns(const bool do_accept) {
     do_accept_new_conns(do_accept);
     pthread_mutex_unlock(&conn_lock);
 }
-/****************************** LIBEVENT THREADS *****************************/
-
-static void setup_thread_notify(LIBEVENT_THREAD *me, struct thread_notify *tn,
-        void(*cb)(int, short, void *)) {
-#ifdef HAVE_EVENTFD
-    event_set(&tn->notify_event, tn->notify_event_fd,
-              EV_READ | EV_PERSIST, cb, me);
-#else
-    event_set(&tn->notify_event, tn->notify_receive_fd,
-              EV_READ | EV_PERSIST, cb, me);
-#endif
-    event_base_set(me->base, &tn->notify_event);
-
-    if (event_add(&tn->notify_event, 0) == -1) {
-        fprintf(stderr, "Can't monitor libevent notify pipe\n");
-        exit(1);
-    }
-}
+/****************************** UPCALL THREADS *****************************/
 
 /*
  * Set up a thread's information.
  */
 static void setup_thread(LIBEVENT_THREAD *me) {
-#if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
-    struct event_config *ev_config;
-    ev_config = event_config_new();
-    event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
-    me->base = event_base_new_with_config(ev_config);
-    event_config_free(ev_config);
-#else
-    me->base = event_init();
-#endif
-
-    if (! me->base) {
-        fprintf(stderr, "Can't allocate event base\n");
+    me->ctrl_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (me->ctrl_fd == -1) {
+        perror("failed creating ctrl eventfd for worker thread");
         exit(1);
     }
 
-    /* Listen for notifications from other threads */
-    setup_thread_notify(me, &me->n, thread_libevent_process);
-    setup_thread_notify(me, &me->ion, thread_libevent_ionotify);
+    me->ion_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (me->ion_fd == -1) {
+        perror("failed creating ion eventfd for worker thread");
+        exit(1);
+    }
+
     pthread_mutex_init(&me->ion_lock, NULL);
     STAILQ_INIT(&me->ion_head);
 
@@ -501,75 +462,22 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     thread_io_queue_add(me, IO_QUEUE_NONE, NULL, NULL);
 }
 
-/*
- * Worker thread: main event loop
- */
-static void *worker_libevent(void *arg) {
-    LIBEVENT_THREAD *me = arg;
+__thread LIBEVENT_THREAD *worker_me = NULL;
 
-    /* Any per-thread setup can happen here; memcached_thread_init() will block until
-     * all threads have finished initializing.
-     */
-    me->l = logger_create();
-    me->lru_bump_buf = item_lru_bump_buf_create();
-    if (me->l == NULL || me->lru_bump_buf == NULL) {
-        abort();
-    }
+static bool workers_go = false;
 
-    if (settings.drop_privileges) {
-        drop_worker_privileges();
-    }
-
-    register_thread_initialized();
-    while (!event_base_got_exit(me->base)) {
-        event_base_loop(me->base, EVLOOP_ONCE);
-        // Run IO queues after the event loop to catch things like
-        // re-submissions from proxy callbacks.
-        thread_io_queue_submit(me);
-#ifdef PROXY
-        if (me->proxy_ctx) {
-            proxy_gc_poke(me);
-        }
-#endif
-    }
-    // same mechanism used to watch for all threads exiting.
-    register_thread_initialized();
-
-    event_base_free(me->base);
-    return NULL;
-}
-
-// Syscalls can be expensive enough that handling a few of them once here can
-// save both throughput and overall latency.
-#define MAX_PIPE_EVENTS 32
-
-// dedicated worker thread notify system for IO objects.
-static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg) {
-    LIBEVENT_THREAD *me = arg;
+static void upcall_ion_cb(struct up_event *evt) {
+    LIBEVENT_THREAD *me = worker_me;
     uint64_t ev_count = 0;
     iop_head_t head;
 
     STAILQ_INIT(&head);
-#ifdef HAVE_EVENTFD
-    if (read(fd, &ev_count, sizeof(uint64_t)) != sizeof(uint64_t)) {
+    if (read(evt->fd, &ev_count, sizeof(uint64_t)) != sizeof(uint64_t)) {
         if (settings.verbose > 0)
-            fprintf(stderr, "Can't read from libevent pipe\n");
+            fprintf(stderr, "Can't read from ion eventfd\n");
         return;
     }
-#else
-    char buf[MAX_PIPE_EVENTS];
 
-    ev_count = read(fd, buf, MAX_PIPE_EVENTS);
-    if (ev_count == 0) {
-        if (settings.verbose > 0)
-            fprintf(stderr, "Can't read from libevent pipe\n");
-        return;
-    }
-#endif
-
-    // pull entire queue and zero the thread head.
-    // need to do this after reading a syscall as we are only guaranteed to
-    // get syscalls if the queue is empty.
     pthread_mutex_lock(&me->ion_lock);
     STAILQ_CONCAT(&head, &me->ion_head);
     pthread_mutex_unlock(&me->ion_lock);
@@ -581,46 +489,28 @@ static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg)
     }
 }
 
-/*
- * Processes an incoming "connection event" item. This is called when
- * input arrives on the libevent wakeup pipe.
- */
-static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) {
-    LIBEVENT_THREAD *me = arg;
+static void worker_ctrl_cb(struct up_event *evt) {
+    LIBEVENT_THREAD *me = worker_me;
     CQ_ITEM *item;
     conn *c;
-    uint64_t ev_count = 0; // max number of events to loop through this run.
-#ifdef HAVE_EVENTFD
-    // NOTE: unlike pipe we aren't limiting the number of events per read.
-    // However we do limit the number of queue pulls to what the count was at
-    // the time of this function firing.
-    if (read(fd, &ev_count, sizeof(uint64_t)) != sizeof(uint64_t)) {
+    uint64_t ev_count = 0;
+
+    if (read(evt->fd, &ev_count, sizeof(uint64_t)) != sizeof(uint64_t)) {
         if (settings.verbose > 0)
-            fprintf(stderr, "Can't read from libevent pipe\n");
+            fprintf(stderr, "Can't read from ctrl eventfd\n");
         return;
     }
-#else
-    char buf[MAX_PIPE_EVENTS];
 
-    ev_count = read(fd, buf, MAX_PIPE_EVENTS);
-    if (ev_count == 0) {
-        if (settings.verbose > 0)
-            fprintf(stderr, "Can't read from libevent pipe\n");
-        return;
-    }
-#endif
-
-    for (int x = 0; x < ev_count; x++) {
+    for (uint64_t x = 0; x < ev_count; x++) {
         item = cq_pop(me->ev_queue);
-        if (item == NULL) {
+        if (item == NULL)
             return;
-        }
 
         switch (item->mode) {
             case queue_new_conn:
-                c = conn_new(item->sfd, item->init_state, item->event_flags,
-                                   item->read_buffer_size, item->transport,
-                                   me->base, item->ssl, item->conntag, item->bproto);
+                c = conn_new(item->sfd, item->init_state,
+                             item->read_buffer_size, item->transport,
+                             item->ssl, item->conntag, item->bproto);
                 if (c == NULL) {
                     if (IS_UDP(item->transport)) {
                         fprintf(stderr, "Can't listen for events on UDP socket\n");
@@ -638,6 +528,11 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     }
                 } else {
                     c->thread = me;
+                    if (IS_UDP(c->transport)) {
+                        add_read(c->sfd, upcall_udp_read_cb);
+                    } else {
+                        add_read(c->sfd, upcall_read_cb);
+                    }
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
                         assert(c->thread && c->thread->ssl_wbuf);
@@ -647,20 +542,16 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                 }
                 break;
             case queue_pause:
-                /* we were told to pause and report in */
                 register_thread_initialized();
                 break;
             case queue_timeout:
-                /* a client socket timed out */
                 conn_close_idle(conns[item->sfd]);
                 break;
             case queue_redispatch:
-                /* a side thread redispatched a client connection */
                 conn_worker_readd(conns[item->sfd]);
                 break;
             case queue_stop:
-                /* asked to stop */
-                event_base_loopexit(me->base, NULL);
+                me->stop_worker = true;
                 break;
 #ifdef PROXY
             case queue_proxy_reload:
@@ -671,6 +562,68 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
 
         cqi_free(me->ev_queue, item);
     }
+}
+
+static void *worker_upcall(void *arg) {
+    LIBEVENT_THREAD *me = arg;
+    worker_me = me;
+
+    me->l = logger_create();
+    me->lru_bump_buf = item_lru_bump_buf_create();
+    if (me->l == NULL || me->lru_bump_buf == NULL) {
+        abort();
+    }
+
+    if (settings.drop_privileges) {
+        drop_worker_privileges();
+    }
+
+    upcall_worker_setup(upfd, 128, 16384);
+    add_read(me->ctrl_fd, worker_ctrl_cb);
+    add_read(me->ion_fd, upcall_ion_cb);
+
+    register_thread_initialized();
+
+    /* Wait for main thread to finish setup before registering listen fds */
+    pthread_mutex_lock(&init_lock);
+    while (!workers_go) {
+        pthread_cond_wait(&init_cond, &init_lock);
+    }
+    pthread_mutex_unlock(&init_lock);
+
+    if (me->thread_baseid == 0) {
+        conn *l;
+        for (l = listen_conn; l != NULL; l = l->next) {
+            if (IS_UDP(l->transport)) {
+                add_read(l->sfd, upcall_udp_read_cb);
+            } else {
+                add_accept(l->sfd, upcall_accept_cb);
+            }
+        }
+        add_read(clock_tfd, upcall_clock_cb);
+        if (maxconns_tfd >= 0)
+            add_read(maxconns_tfd, upcall_maxconns_cb);
+    }
+
+    while (!me->stop_worker) {
+        run_event_loop(upfd, false);
+        thread_io_queue_submit(me);
+#ifdef PROXY
+        if (me->proxy_ctx) {
+            proxy_gc_poke(me);
+        }
+#endif
+    }
+
+    register_thread_initialized();
+    return NULL;
+}
+
+void upcall_workers_go(void) {
+    pthread_mutex_lock(&init_lock);
+    workers_go = true;
+    pthread_cond_broadcast(&init_cond);
+    pthread_mutex_unlock(&init_lock);
 }
 
 // Interface is slightly different on various platforms.
@@ -693,9 +646,6 @@ LIBEVENT_THREAD *get_worker_thread(int id) {
 /* Which thread we assigned a connection to most recently. */
 static int last_thread = -1;
 
-/* Last thread we assigned to a connection based on napi_id */
-static int last_thread_by_napi_id = -1;
-
 static LIBEVENT_THREAD *select_thread_round_robin(void)
 {
     int tid = (last_thread + 1) % settings.num_threads;
@@ -705,80 +655,18 @@ static LIBEVENT_THREAD *select_thread_round_robin(void)
     return threads + tid;
 }
 
-static void reset_threads_napi_id(void)
-{
-    LIBEVENT_THREAD *thread;
-    int i;
-
-    for (i = 0; i < settings.num_threads; i++) {
-         thread = threads + i;
-         thread->napi_id = 0;
-    }
-
-    last_thread_by_napi_id = -1;
-}
-
-/* Select a worker thread based on the NAPI ID of an incoming connection
- * request. NAPI ID is a globally unique ID that identifies a NIC RX queue
- * on which a flow is received.
- */
-static LIBEVENT_THREAD *select_thread_by_napi_id(int sfd)
-{
-    LIBEVENT_THREAD *thread;
-    int napi_id, err, i;
-    socklen_t len;
-    int tid = -1;
-
-    len = sizeof(socklen_t);
-    err = getsockopt(sfd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napi_id, &len);
-    if ((err == -1) || (napi_id == 0)) {
-        STATS_LOCK();
-        stats.round_robin_fallback++;
-        STATS_UNLOCK();
-        return select_thread_round_robin();
-    }
-
-select:
-    for (i = 0; i < settings.num_threads; i++) {
-         thread = threads + i;
-         if (last_thread_by_napi_id < i) {
-             thread->napi_id = napi_id;
-             last_thread_by_napi_id = i;
-             tid = i;
-             break;
-         }
-         if (thread->napi_id == napi_id) {
-             tid = i;
-             break;
-         }
-    }
-
-    if (tid == -1) {
-        STATS_LOCK();
-        stats.unexpected_napi_ids++;
-        STATS_UNLOCK();
-        reset_threads_napi_id();
-        goto select;
-    }
-
-    return threads + tid;
-}
-
 /*
  * Dispatches a new connection to another thread. This is only ever called
  * from the main thread, either during initialization (for UDP) or because
  * of an incoming connection.
  */
-void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
+void dispatch_conn_new(int sfd, enum conn_states init_state,
                        int read_buffer_size, enum network_transport transport, void *ssl,
                        uint64_t conntag, enum protocol bproto) {
     CQ_ITEM *item = NULL;
     LIBEVENT_THREAD *thread;
 
-    if (!settings.num_napi_ids)
-        thread = select_thread_round_robin();
-    else
-        thread = select_thread_by_napi_id(sfd);
+    thread = select_thread_round_robin();
 
     item = cqi_new(thread->ev_queue);
     if (item == NULL) {
@@ -790,7 +678,6 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
 
     item->sfd = sfd;
     item->init_state = init_state;
-    item->event_flags = event_flags;
     item->read_buffer_size = read_buffer_size;
     item->transport = transport;
     item->mode = queue_new_conn;
@@ -832,19 +719,10 @@ void return_io_pending(io_pending_t *io) {
     // skip the syscall if there was already data in the queue, as it's
     // already been notified.
     if (do_notify) {
-#ifdef HAVE_EVENTFD
         uint64_t u = 1;
-        if (write(t->ion.notify_event_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
-            perror("failed writing to worker eventfd");
-            /* TODO: This is a fatal problem. Can it ever happen temporarily? */
+        if (write(t->ion_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
+            perror("failed writing to worker ion eventfd");
         }
-#else
-        char buf[1] = "c";
-        if (write(t->ion.notify_send_fd, buf, 1) != 1) {
-            perror("Failed writing to notify pipe");
-            /* TODO: This is a fatal problem. Can it ever happen temporarily? */
-        }
-#endif
     }
 }
 
@@ -1056,25 +934,6 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
     }
 }
 
-static void memcached_thread_notify_init(struct thread_notify *tn) {
-#ifdef HAVE_EVENTFD
-        tn->notify_event_fd = eventfd(0, EFD_NONBLOCK);
-        if (tn->notify_event_fd == -1) {
-            perror("failed creating eventfd for worker thread");
-            exit(1);
-        }
-#else
-        int fds[2];
-        if (pipe(fds)) {
-            perror("Can't create notify pipe");
-            exit(1);
-        }
-
-        tn->notify_receive_fd = fds[0];
-        tn->notify_send_fd = fds[1];
-#endif
-}
-
 /*
  * Initializes the thread subsystem, creating various worker threads.
  *
@@ -1134,20 +993,15 @@ void memcached_thread_init(int nthreads, void *arg) {
     }
 
     for (i = 0; i < nthreads; i++) {
-        memcached_thread_notify_init(&threads[i].n);
-        memcached_thread_notify_init(&threads[i].ion);
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
         threads[i].thread_baseid = i;
         setup_thread(&threads[i]);
-        /* Reserve three fds for the libevent base, and two for the pipe */
-        stats_state.reserved_fds += 5;
     }
 
-    /* Create threads after we've done all the libevent setup. */
     for (i = 0; i < nthreads; i++) {
-        create_worker(worker_libevent, &threads[i]);
+        create_worker(worker_upcall, &threads[i]);
     }
 
     /* Wait for all the threads to set themselves up before returning. */

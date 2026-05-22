@@ -1004,7 +1004,6 @@ static void process_watch_command(conn *c, mcp_parser_t *pr) {
             break;
         case LOGGER_ADD_WATCHER_OK:
             conn_set_state(c, conn_watch);
-            event_del(&c->event);
             break;
     }
 }
@@ -1341,7 +1340,6 @@ static void process_lru_crawler_command(conn *c, mcp_parser_t *pr) {
                 //out_string(c, "OK");
                 // TODO: Don't reuse conn_watch here.
                 conn_set_state(c, conn_watch);
-                event_del(&c->event);
                 break;
             case CRAWLER_RUNNING:
                 out_string(c, "BUSY currently processing crawler request");
@@ -1381,7 +1379,6 @@ static void process_lru_crawler_command(conn *c, mcp_parser_t *pr) {
         switch(rv) {
             case CRAWLER_OK:
                 conn_set_state(c, conn_watch);
-                event_del(&c->event);
                 break;
             case CRAWLER_RUNNING:
                 out_string(c, "BUSY currently processing crawler request");

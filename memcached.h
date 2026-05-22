@@ -13,7 +13,11 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
-#include <event.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/timerfd.h>
+#include "../../libupcall/upcall.h"
 #include <netdb.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -58,11 +62,6 @@
 #endif
 
 #include "sasl_defs.h"
-
-/* for NAPI pinning feature */
-#ifndef SO_INCOMING_NAPI_ID
-#define SO_INCOMING_NAPI_ID 56
-#endif
 
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
@@ -421,8 +420,6 @@ struct stats {
     uint64_t      ssl_new_sessions; /* successfully negotiated new (non-reused) TLS sessions */
 #endif
     struct timeval maxconns_entered;  /* last time maxconns entered */
-    uint64_t      unexpected_napi_ids;  /* see doc/napi_ids.txt */
-    uint64_t      round_robin_fallback; /* see doc/napi_ids.txt */
 };
 
 /**
@@ -436,7 +433,6 @@ struct stats_state {
     uint64_t      hash_bytes;       /* size used for hash tables */
     float         extstore_memory_pressure; /* when extstore might memory evict */
     unsigned int  conn_structs;
-    unsigned int  reserved_fds;
     unsigned int  hash_power_level; /* Better hope it's not over 9000 */
     unsigned int  log_watchers; /* number of currently active watchers */
     bool          hash_is_expanding; /* If the hash table is being expanded */
@@ -466,7 +462,6 @@ struct settings {
     double factor;          /* chunk size growth factor */
     int chunk_size;
     int num_threads;        /* number of worker (without dispatcher) libevent threads to run */
-    int num_threads_per_udp; /* number of worker threads serving each udp socket */
     char prefix_delimiter;  /* character that marks a key prefix (for stats) */
     int detail_enabled;     /* nonzero if we're collecting detailed stats */
     int reqs_per_event;     /* Maximum number of io to process on each
@@ -543,7 +538,6 @@ struct settings {
     bool ssl_kernel_tls; /* enable server kTLS */
     int ssl_min_version; /* minimum SSL protocol version to accept */
 #endif
-    int num_napi_ids;   /* maximum number of NAPI IDs */
     char *memory_file;  /* warm restart memory file path */
 #ifdef PROXY
     bool proxy_enabled;
@@ -707,22 +701,12 @@ typedef struct io_queue_s {
     int type;
 } io_queue_t;
 
-struct thread_notify {
-    struct event notify_event;  /* listen event for notify pipe or eventfd */
-#ifdef HAVE_EVENTFD
-    int notify_event_fd;        /* notify counter */
-#else
-    int notify_receive_fd;      /* receiving end of notify pipe */
-    int notify_send_fd;         /* sending end of notify pipe */
-#endif
-};
-
 typedef struct _mc_resp_bundle mc_resp_bundle;
 typedef struct {
     pthread_t thread_id;        /* unique ID of this thread */
-    struct event_base *base;    /* libevent handle this thread uses */
-    struct thread_notify n;     /* for thread notification */
-    struct thread_notify ion;   /* for thread IO object notification */
+    int ctrl_fd;                /* eventfd for ctrl queue (pause/stop/dispatch) */
+    int ion_fd;                 /* eventfd for IO object return notification */
+    volatile bool stop_worker;  /* set true by queue_stop handler */
     pthread_mutex_t ion_lock;   /* mutex for ion_head */
     iop_head_t ion_head;        /* queue for IO object return */
     int cur_sfd;                /* client fd for logging commands */
@@ -742,7 +726,6 @@ typedef struct {
 #ifdef TLS
     char   *ssl_wbuf;
 #endif
-    int napi_id;                /* napi id associated with this thread */
 #ifdef PROXY
     void *proxy_ctx; // proxy global context
     void *L; // lua VM
@@ -849,14 +832,12 @@ struct conn {
     enum conn_states  state;
     enum bin_substates substate;
     rel_time_t last_cmd_time;
-    struct event event;
-    short  ev_flags;
-    short  which;   /** which events were just triggered */
 
     char   *rbuf;   /** buffer to read commands into */
     char   *rcurr;  /** but if we parsed some already, this is where we stopped */
     int    rsize;   /** total allocated size of rbuf */
     int    rbytes;  /** how much data, starting from rcur, do we have unparsed */
+    char   *upcall_wbuf; /** flat write buffer malloc'd for upcall add_write */
 
     mc_resp *resp; // tail response.
     mc_resp *resp_head; // first response in current stack.
@@ -960,8 +941,9 @@ void conn_io_queue_return(io_pending_t *io);
         } \
     } while (0)
 
-conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size,
-    enum network_transport transport, struct event_base *base, void *ssl, uint64_t conntag, enum protocol bproto);
+conn *conn_new(const int sfd, const enum conn_states init_state,
+    const int read_buffer_size, enum network_transport transport,
+    void *ssl, uint64_t conntag, enum protocol bproto);
 
 void conn_worker_readd(conn *c);
 extern int daemonize(int nochdir, int noclose);
@@ -991,8 +973,22 @@ void timeout_conn(conn *c);
 void proxy_reload_notify(LIBEVENT_THREAD *t);
 #endif
 void return_io_pending(io_pending_t *io);
-void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size,
+void dispatch_conn_new(int sfd, enum conn_states init_state, int read_buffer_size,
     enum network_transport transport, void *ssl, uint64_t conntag, enum protocol bproto);
+/* upcall globals and callbacks */
+extern int maxconns_tfd;
+extern int upfd;
+extern int clock_tfd;
+extern conn *listen_conn;
+void upcall_workers_go(void);
+void upcall_accept_cb(struct up_event *evt);
+void upcall_read_cb(struct up_event *evt);
+void upcall_udp_read_cb(struct up_event *evt);
+void upcall_nread_cb(struct up_event *evt);
+void upcall_swallow_cb(struct up_event *evt);
+void upcall_clock_cb(struct up_event *evt);
+void upcall_maxconns_cb(struct up_event *evt);
+void upcall_write_cb(struct up_event *evt);
 void sidethread_conn_close(conn *c);
 
 /* Lock wrappers for cache functions that are called from main loop. */
