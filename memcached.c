@@ -48,6 +48,13 @@
 #include <sysexits.h>
 #include <stddef.h>
 
+/* Header prepended to every write buffer so write_handler can detect stale
+ * completions that arrive after the connection was closed and the fd reused. */
+struct write_ctx {
+    conn     *c;
+    uint64_t  gen;
+};
+
 #ifdef HAVE_GETOPT_LONG
 #include <getopt.h>
 #endif
@@ -571,7 +578,11 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->transport = transport;
     c->protocol = bproto;
-    c->tag = conntag;
+    /* Use tag as a generation counter so write_handler can detect stale
+     * completions after fd reuse. Increment on reuse; 0 for fresh allocs. */
+    if (conns[sfd]) {
+        c->tag++;
+    }
 
     /* unix socket mode doesn't need this, so zeroed out.  but why
      * is this done for every command?  presumably for UDP
@@ -790,6 +801,17 @@ static void conn_close(conn *c) {
     if (worker_me) {
         c->rbytes = 0;
         rbuf_release(c);
+        /* Release any held-but-empty resp bundles. resp_free keeps the last
+         * empty bundle alive for reuse, but on close it must be freed. */
+        if (c->open_bundle) {
+            mc_resp_bundle *b = c->open_bundle;
+            while (b) {
+                mc_resp_bundle *next = b->next;
+                cache_free(worker_me->rbuf_cache, b);
+                b = next;
+            }
+            c->open_bundle = NULL;
+        }
     }
 
     MEMCACHED_CONN_RELEASE(c->sfd);
@@ -2782,11 +2804,19 @@ void read_handler(struct up_event *evt) {
 }
 
 void write_handler(struct up_event *evt) {
+    /* Recover the write_ctx header that issue_write prepended before the data.
+     * The kernel wrote only (ctx+1)[0..len-1] to the socket; the header was
+     * not transmitted. */
+    struct write_ctx *ctx = (struct write_ctx *)evt->buf - 1;
+    conn    *orig_c = ctx->c;
+    uint64_t orig_gen = ctx->gen;
+    free(ctx);
+
     conn *c = conns[evt->fd];
 
-    free(evt->buf);
-
-    if (c == NULL)
+    /* Discard stale completions: the fd was reused for a different connection,
+     * or the conn struct generation was bumped by conn_new on fd reuse. */
+    if (c == NULL || c != orig_c || c->tag != orig_gen)
         return;
 
     if (evt->result < 0) {
@@ -2831,7 +2861,8 @@ static void issue_write(conn *c) {
     struct iovec iovs[IOV_MAX];
     int iovused, i;
     size_t total = 0;
-    char *buf, *p;
+    struct write_ctx *ctx;
+    char *p;
 
     iovused = _transmit_pre(c, iovs, 0, TRANSMIT_ALL_RESP);
     if (iovused == 0) {
@@ -2843,20 +2874,24 @@ static void issue_write(conn *c) {
     for (i = 0; i < iovused; i++)
         total += iovs[i].iov_len;
 
-    buf = malloc(total);
-    if (!buf) {
+    /* Allocate header + data in one block. Pass only the data portion to
+     * add_write; recover the header in write_handler via pointer arithmetic. */
+    ctx = malloc(sizeof(*ctx) + total);
+    if (!ctx) {
         conn_set_state(c, conn_closing);
         drive_machine(c);
         return;
     }
+    ctx->c   = c;
+    ctx->gen = c->tag;
 
-    p = buf;
+    p = (char *)(ctx + 1);
     for (i = 0; i < iovused; i++) {
         memcpy(p, iovs[i].iov_base, iovs[i].iov_len);
         p += iovs[i].iov_len;
     }
 
-    add_write(c->sfd, buf, total, write_handler);
+    add_write(c->sfd, ctx + 1, total, write_handler);
 }
 
 static void drive_machine(conn *c) {

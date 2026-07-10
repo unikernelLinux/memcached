@@ -277,7 +277,6 @@ static int worker_listen(const char *interface, int port) {
     };
     struct addrinfo *ai, *next;
     char port_buf[NI_MAXSERV];
-    struct linger ling = {0, 0};
     int flags = 1, error, sfd, success = 0;
 
     snprintf(port_buf, sizeof(port_buf), "%d", port);
@@ -296,7 +295,6 @@ static int worker_listen(const char *interface, int port) {
         setsockopt(sfd, SOL_SOCKET,  SO_REUSEPORT, &flags, sizeof(flags));
         setsockopt(sfd, SOL_SOCKET,  SO_REUSEADDR, &flags, sizeof(flags));
         setsockopt(sfd, SOL_SOCKET,  SO_KEEPALIVE, &flags, sizeof(flags));
-        setsockopt(sfd, SOL_SOCKET,  SO_LINGER,    &ling,  sizeof(ling));
         setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY,  &flags, sizeof(flags));
 
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
