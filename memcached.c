@@ -816,6 +816,11 @@ static void conn_close(conn *c) {
 
     MEMCACHED_CONN_RELEASE(c->sfd);
     conn_set_state(c, conn_closed);
+    /* Invalidate any in-flight write completions that hold orig_gen.
+     * Without this, a pending write_handler fires after close(), sees
+     * c->tag == orig_gen, passes the staleness check, and calls
+     * conn_close() again — closing whatever fd the OS reused in between. */
+    c->tag++;
     if (c->ssl_enabled) {
         ssl_conn_close(c->ssl);
     }
