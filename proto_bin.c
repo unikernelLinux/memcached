@@ -291,7 +291,7 @@ static void complete_incr_bin(conn *c, char *extbuf) {
     if (c->binary_header.request.cas != 0) {
         cas = c->binary_header.request.cas;
     }
-    switch(add_delta(c->thread, key, nkey, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
+    switch(add_delta(worker_me, key, nkey, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
                      req->message.body.delta, tmpbuf,
                      &cas)) {
     case OK:
@@ -323,9 +323,9 @@ static void complete_incr_bin(conn *c, char *extbuf) {
                 uint64_t cas = 0;
                 memcpy(ITEM_data(it), tmpbuf, res);
                 memcpy(ITEM_data(it) + res, "\r\n", 2);
-                c->thread->cur_sfd = c->sfd; // for store_item logging.
+                worker_me->cur_sfd = c->sfd; // for store_item logging.
 
-                if (store_item(it, NREAD_ADD, c->thread, NULL, &cas, (settings.use_cas) ? get_cas_id() : 0, CAS_NO_STALE)) {
+                if (store_item(it, NREAD_ADD, worker_me, NULL, &cas, (settings.use_cas) ? get_cas_id() : 0, CAS_NO_STALE)) {
                     c->cas = cas;
                     write_bin_response(c, &rsp->message.body, 0, 0, sizeof(rsp->message.body.value));
                 } else {
@@ -338,13 +338,13 @@ static void complete_incr_bin(conn *c, char *extbuf) {
                         "SERVER_ERROR Out of memory allocating new item");
             }
         } else {
-            pthread_mutex_lock(&c->thread->stats.mutex);
+            pthread_mutex_lock(&worker_me->stats.mutex);
             if (c->cmd == PROTOCOL_BINARY_CMD_INCREMENT) {
-                c->thread->stats.incr_misses++;
+                worker_me->stats.incr_misses++;
             } else {
-                c->thread->stats.decr_misses++;
+                worker_me->stats.decr_misses++;
             }
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            pthread_mutex_unlock(&worker_me->stats.mutex);
 
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
         }
@@ -361,9 +361,9 @@ static void complete_update_bin(conn *c) {
     assert(c != NULL);
 
     item *it = c->item;
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    pthread_mutex_lock(&worker_me->stats.mutex);
+    worker_me->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
+    pthread_mutex_unlock(&worker_me->stats.mutex);
 
     /* We don't actually receive the trailing two characters in the bin
      * protocol, so we're going to just set them here */
@@ -382,8 +382,8 @@ static void complete_update_bin(conn *c) {
     }
 
     uint64_t cas = 0;
-    c->thread->cur_sfd = c->sfd; // for store_item logging.
-    ret = store_item(it, c->cmd, c->thread, NULL, &cas, (settings.use_cas) ? get_cas_id() : 0, CAS_NO_STALE);
+    worker_me->cur_sfd = c->sfd; // for store_item logging.
+    ret = store_item(it, c->cmd, worker_me, NULL, &cas, (settings.use_cas) ? get_cas_id() : 0, CAS_NO_STALE);
     c->cas = cas;
 
 #ifdef ENABLE_DTRACE
@@ -477,9 +477,9 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
         protocol_binary_request_touch *t = (void *)extbuf;
         time_t exptime = ntohl(t->message.body.expiration);
 
-        it = item_touch(key, nkey, realtime(exptime), c->thread);
+        it = item_touch(key, nkey, realtime(exptime), worker_me);
     } else {
-        it = item_get(key, nkey, c->thread, DO_UPDATE);
+        it = item_get(key, nkey, worker_me, DO_UPDATE);
     }
 
     if (it) {
@@ -487,15 +487,15 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
         uint16_t keylen = 0;
         uint32_t bodylen = sizeof(rsp->message.body) + (it->nbytes - 2);
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
         if (should_touch) {
-            c->thread->stats.touch_cmds++;
-            c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+            worker_me->stats.touch_cmds++;
+            worker_me->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
         } else {
-            c->thread->stats.get_cmds++;
-            c->thread->stats.lru_hits[it->slabs_clsid]++;
+            worker_me->stats.get_cmds++;
+            worker_me->stats.lru_hits[it->slabs_clsid]++;
         }
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_unlock(&worker_me->stats.mutex);
 
         if (should_touch) {
             MEMCACHED_COMMAND_TOUCH(c->sfd, ITEM_key(it), it->nkey,
@@ -530,10 +530,10 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
             if (it->it_flags & ITEM_HDR) {
                 mc_resp *resp = c->resp;
                 resp->binary_prot = true;
-                if (storage_get_item(c->thread, it, resp) != 0) {
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.get_oom_extstore++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                if (storage_get_item(worker_me, it, resp) != 0) {
+                    pthread_mutex_lock(&worker_me->stats.mutex);
+                    worker_me->stats.get_oom_extstore++;
+                    pthread_mutex_unlock(&worker_me->stats.mutex);
 
                     failed = true;
                 } else {
@@ -577,15 +577,15 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
     }
 
     if (failed) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
         if (should_touch) {
-            c->thread->stats.touch_cmds++;
-            c->thread->stats.touch_misses++;
+            worker_me->stats.touch_cmds++;
+            worker_me->stats.touch_misses++;
         } else {
-            c->thread->stats.get_cmds++;
-            c->thread->stats.get_misses++;
+            worker_me->stats.get_cmds++;
+            worker_me->stats.get_misses++;
         }
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_unlock(&worker_me->stats.mutex);
 
         if (should_touch) {
             MEMCACHED_COMMAND_TOUCH(c->sfd, key, nkey, -1, 0);
@@ -843,9 +843,9 @@ static void process_bin_complete_sasl_auth(conn *c) {
     case SASL_OK:
         c->authenticated = true;
         write_bin_response(c, "Authenticated", 0, 0, strlen("Authenticated"));
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.auth_cmds++;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
         break;
     case SASL_CONTINUE:
         add_bin_header(c, PROTOCOL_BINARY_RESPONSE_AUTH_CONTINUE, 0, 0, outlen);
@@ -859,10 +859,10 @@ static void process_bin_complete_sasl_auth(conn *c) {
         if (settings.verbose)
             fprintf(stderr, "Unknown sasl response:  %d\n", result);
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        c->thread->stats.auth_errors++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.auth_cmds++;
+        worker_me->stats.auth_errors++;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
     }
 }
 
@@ -895,7 +895,7 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
     uint8_t extlen = c->binary_header.request.extlen;
     uint16_t keylen = c->binary_header.request.keylen;
     uint32_t bodylen = c->binary_header.request.bodylen;
-    c->thread->cur_sfd = c->sfd; // cuddle sfd for logging.
+    worker_me->cur_sfd = c->sfd; // cuddle sfd for logging.
 
     if (keylen > bodylen || keylen + extlen > bodylen) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND, NULL, 0);
@@ -1145,17 +1145,17 @@ static void process_bin_update(conn *c, char *extbuf) {
             status = NO_MEMORY;
         }
         /* FIXME: losing c->cmd since it's translated below. refactor? */
-        LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
+        LOGGER_LOG(worker_me->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
                 NULL, status, 0, key, nkey, req->message.body.expiration,
                 0, c->sfd);
 
         /* Avoid stale data persisting in cache because we failed alloc.
          * Unacceptable for SET. Anywhere else too? */
         if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
-            it = item_get(key, nkey, c->thread, DONT_UPDATE);
+            it = item_get(key, nkey, worker_me, DONT_UPDATE);
             if (it) {
                 item_unlink(it);
-                STORAGE_delete(c->thread->storage, it);
+                STORAGE_delete(worker_me->storage, it);
                 item_remove(it);
             }
         }
@@ -1286,9 +1286,9 @@ static void process_bin_flush(conn *c, char *extbuf) {
     settings.oldest_live = new_oldest;
     item_flush_expired();
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.flush_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    pthread_mutex_lock(&worker_me->stats.mutex);
+    worker_me->stats.flush_cmds++;
+    pthread_mutex_unlock(&worker_me->stats.mutex);
 
     write_bin_response(c, NULL, 0, 0, 0);
 }
@@ -1314,16 +1314,16 @@ static void process_bin_delete(conn *c) {
         stats_prefix_record_delete(key, nkey);
     }
 
-    it = item_get_locked(key, nkey, c->thread, DONT_UPDATE, &hv);
+    it = item_get_locked(key, nkey, worker_me, DONT_UPDATE, &hv);
     if (it) {
         uint64_t cas = c->binary_header.request.cas;
         if (cas == 0 || cas == ITEM_get_cas(it)) {
             MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            pthread_mutex_lock(&worker_me->stats.mutex);
+            worker_me->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+            pthread_mutex_unlock(&worker_me->stats.mutex);
             do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
+            STORAGE_delete(worker_me->storage, it);
             write_bin_response(c, NULL, 0, 0, 0);
         } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
@@ -1331,9 +1331,9 @@ static void process_bin_delete(conn *c) {
         do_item_remove(it);      /* release our reference */
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.delete_misses++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.delete_misses++;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
     }
     item_unlock(hv);
 }

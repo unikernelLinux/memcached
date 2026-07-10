@@ -159,8 +159,8 @@ void complete_nread_ascii(conn *c) {
         out_string(c, "CLIENT_ERROR bad data chunk");
     } else {
       uint64_t cas = 0;
-      c->thread->cur_sfd = c->sfd; // cuddle sfd for logging.
-      ret = store_item(it, comm, c->thread, &nbytes, &cas, c->cas ? c->cas : get_cas_id(), c->resp->set_stale);
+      worker_me->cur_sfd = c->sfd; // cuddle sfd for logging.
+      ret = store_item(it, comm, worker_me, &nbytes, &cas, c->cas ? c->cas : get_cas_id(), c->resp->set_stale);
       c->cas = 0;
 
 #ifdef ENABLE_DTRACE
@@ -333,15 +333,15 @@ int try_read_command_asciiauth(conn *c) {
         out_string(c, "STORED");
         c->authenticated = true;
         c->try_read_command = try_read_command_ascii;
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.auth_cmds++;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
     } else {
         out_string(c, "CLIENT_ERROR authentication failure");
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        c->thread->stats.auth_errors++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.auth_cmds++;
+        worker_me->stats.auth_errors++;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
     }
 
     return 1;
@@ -441,14 +441,9 @@ static void process_get_command(conn *c, LIBEVENT_THREAD *t, mcp_parser_t *pr, p
     }
 
     while (klen != 0) {
-        mc_resp *resp = c->resp;
         if (process_get_cmd(t, curkey, klen, c->resp, storage_get_item, exptime, return_cas, should_touch) != 0) {
             process_get_command_err(c, NULL);
             return;
-        }
-        if (resp->io_pending) {
-            resp->io_pending->c = c;
-            conn_resp_suspend(c, resp);
         }
         curkey += klen;
         klen = 0;
@@ -632,7 +627,7 @@ static void process_meta_command(conn *c, mcp_parser_t *pr) {
     }
 
     bool overflow; // not used here.
-    item *it = limited_get(key, nkey, c->thread, 0, false, DONT_UPDATE, &overflow);
+    item *it = limited_get(key, nkey, worker_me, 0, false, DONT_UPDATE, &overflow);
     if (it) {
         mc_resp *resp = c->resp;
         size_t total = 0;
@@ -668,9 +663,9 @@ static void process_meta_command(conn *c, mcp_parser_t *pr) {
     } else {
         out_string(c, "EN");
     }
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.meta_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    pthread_mutex_lock(&worker_me->stats.mutex);
+    worker_me->stats.meta_cmds++;
+    pthread_mutex_unlock(&worker_me->stats.mutex);
 }
 
 // Text handler requires some custom code around the update code: we directly
@@ -685,7 +680,7 @@ static void process_mset_command(conn *c, mcp_parser_t *pr, mc_resp *resp) {
     short comm = 0;
     item *it;
     char *errstr = "CLIENT_ERROR bad command line format";
-    c->item = it = process_mset_cmd_start(c->thread, pr, resp, &cas_in, &has_cas_in, &comm);
+    c->item = it = process_mset_cmd_start(worker_me, pr, resp, &cas_in, &has_cas_in, &comm);
     if (it == NULL) {
         c->sbytes = pr->vlen;
         conn_set_state(c, conn_swallow);
@@ -754,7 +749,7 @@ error:
 }
 
 static void process_update_command(conn *c, mcp_parser_t *pr, mc_resp *resp, int comm, bool handle_cas) {
-    item *it = process_update_cmd_start(c->thread, pr, resp, comm, handle_cas);
+    item *it = process_update_cmd_start(worker_me, pr, resp, comm, handle_cas);
     if (it == NULL) {
         conn_set_state(c, conn_swallow);
         c->sbytes = pr->vlen;
@@ -858,7 +853,7 @@ static void process_debugitem_command(conn *c, mcp_parser_t *pr) {
         item_unlock(hv);
     } else if (strncmp(subcmd, "ref", len) == 0) {
         // intentionally leak a reference.
-        item *it = item_get(key, klen, c->thread, DONT_UPDATE);
+        item *it = item_get(key, klen, worker_me, DONT_UPDATE);
         if (it == NULL) {
             out_string(c, "MISS");
             return;
@@ -874,7 +869,7 @@ static void process_debugitem_command(conn *c, mcp_parser_t *pr) {
         } else {
             // double unlink. debugger must have already ref'ed it or this
             // underflows.
-            item *it = item_get(key, klen, c->thread, DONT_UPDATE);
+            item *it = item_get(key, klen, worker_me, DONT_UPDATE);
             if (it == NULL) {
                 out_string(c, "MISS");
                 return;
@@ -1004,7 +999,6 @@ static void process_watch_command(conn *c, mcp_parser_t *pr) {
             break;
         case LOGGER_ADD_WATCHER_OK:
             conn_set_state(c, conn_watch);
-            event_del(&c->event);
             break;
     }
 }
@@ -1165,9 +1159,9 @@ static void process_flush_all_command(conn *c, mcp_parser_t *pr) {
     int32_t exptime = 0;
     rel_time_t new_oldest = 0;
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.flush_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    pthread_mutex_lock(&worker_me->stats.mutex);
+    worker_me->stats.flush_cmds++;
+    pthread_mutex_unlock(&worker_me->stats.mutex);
 
     if (!settings.flush_enabled) {
         // flush_all is not allowed but we log it on stats
@@ -1341,7 +1335,6 @@ static void process_lru_crawler_command(conn *c, mcp_parser_t *pr) {
                 //out_string(c, "OK");
                 // TODO: Don't reuse conn_watch here.
                 conn_set_state(c, conn_watch);
-                event_del(&c->event);
                 break;
             case CRAWLER_RUNNING:
                 out_string(c, "BUSY currently processing crawler request");
@@ -1381,7 +1374,6 @@ static void process_lru_crawler_command(conn *c, mcp_parser_t *pr) {
         switch(rv) {
             case CRAWLER_OK:
                 conn_set_state(c, conn_watch);
-                event_del(&c->event);
                 break;
             case CRAWLER_RUNNING:
                 out_string(c, "BUSY currently processing crawler request");
@@ -1516,7 +1508,7 @@ static const struct text_cmd_entry text_cmd_entries[] = {
 
 void process_command_ascii(conn *c, char *command, size_t cmdlen) {
     mcp_parser_t pr = {0};
-    LIBEVENT_THREAD *t = c->thread;
+    LIBEVENT_THREAD *t = worker_me;
     // Prep the response object for this query.
     if (!resp_start(c)) {
         conn_set_state(c, conn_closing);
@@ -1542,12 +1534,7 @@ void process_command_ascii(conn *c, char *command, size_t cmdlen) {
                 break;
              case CMD_MG:
                 process_mget_cmd(t, &pr, resp, storage_get_item);
-                if (resp->io_pending) {
-                    resp->io_pending->c = c;
-                    conn_resp_suspend(c, resp);
-                } else {
-                    conn_set_state(c, conn_new_cmd);
-                }
+                conn_set_state(c, conn_new_cmd);
                 break;
             case CMD_MN:
                 out_string(c, "MN");

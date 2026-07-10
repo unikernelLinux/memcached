@@ -6,6 +6,7 @@
 
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "memcached.h"
+#ifdef EXTSTORE
 #include "slab_automove_extstore.h"
 #include <stdlib.h>
 #include <string.h>
@@ -249,3 +250,4 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
     }
     return;
 }
+#endif /* EXTSTORE */

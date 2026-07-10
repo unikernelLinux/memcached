@@ -2,6 +2,7 @@
 #ifndef LOGGER_H
 #define LOGGER_H
 
+#include <stdarg.h>
 #include "bipbuffer.h"
 
 /* TODO: starttime tunable */

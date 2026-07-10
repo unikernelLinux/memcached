@@ -419,20 +419,20 @@ static void recache_or_free(io_pending_t *pending) {
         io_queue_t *q = thread_io_queue_get(p->thread, p->io_queue_type);
         STAILQ_REMOVE(&q->stack, pending, _io_pending_t, iop_next);
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.get_aborted_extstore++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.get_aborted_extstore++;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
     } else if (p->miss) {
         // If request was ultimately a miss, unlink the header.
         do_free = false;
         size_t ntotal = ITEM_ntotal(p->hdr_it);
         item_unlink(p->hdr_it);
         slabs_free(it, slabs_clsid(ntotal));
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.miss_from_extstore++;
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.miss_from_extstore++;
         if (p->badcrc)
-            c->thread->stats.badcrc_from_extstore++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+            worker_me->stats.badcrc_from_extstore++;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
     } else if (settings.ext_recache_rate) {
         // hashvalue is cuddled during store
         uint32_t hv = (uint32_t)it->time;
@@ -452,11 +452,11 @@ static void recache_or_free(io_pending_t *pending) {
                 it->it_flags |= (h_it->it_flags & (ITEM_PRESERVE_FLAGS));
                 it->refcount = 0;
                 it->h_next = NULL; // might not be necessary.
-                STORAGE_delete(c->thread->storage, h_it);
+                STORAGE_delete(worker_me->storage, h_it);
                 item_replace(h_it, it, hv, ITEM_get_cas(h_it));
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.recache_from_extstore++;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
+                pthread_mutex_lock(&worker_me->stats.mutex);
+                worker_me->stats.recache_from_extstore++;
+                pthread_mutex_unlock(&worker_me->stats.mutex);
             }
         }
         if (hold_lock)

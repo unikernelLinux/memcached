@@ -174,14 +174,14 @@ static ssize_t ssl_read(conn *c, void *buf, size_t count) {
             return 0;
         } else if (err == SSL_ERROR_SYSCALL) {
             // need to rely on errno to find out what happened
-            LOGGER_LOG(c->thread->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
+            LOGGER_LOG(worker_me->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
                     NULL, c->sfd, strerror(errno));
         } else if (ret != 0) {
             char ssl_err[SSL_ERROR_MSG_SIZE];
             // OpenSSL internal error. One or more, but lets only care about
             // the top error for now.
             print_ssl_error(ssl_err, SSL_ERROR_MSG_SIZE);
-            LOGGER_LOG(c->thread->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
+            LOGGER_LOG(worker_me->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
                     NULL, c->sfd, ssl_err);
             STATS_LOCK();
             stats.ssl_proto_errors++;
@@ -210,14 +210,14 @@ static ssize_t ssl_write(conn *c, void *buf, size_t count) {
             return 0;
         } else if (err == SSL_ERROR_SYSCALL) {
             // need to rely on errno to find out what happened
-            LOGGER_LOG(c->thread->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
+            LOGGER_LOG(worker_me->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
                     NULL, c->sfd, strerror(errno));
         } else if (ret != 0) {
             char ssl_err[SSL_ERROR_MSG_SIZE];
             // OpenSSL internal error. One or more, but lets only care about
             // the top error for now.
             print_ssl_error(ssl_err, SSL_ERROR_MSG_SIZE);
-            LOGGER_LOG(c->thread->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
+            LOGGER_LOG(worker_me->l, LOG_CONNEVENTS, LOGGER_CONNECTION_TLSERROR,
                     NULL, c->sfd, ssl_err);
             STATS_LOCK();
             stats.ssl_proto_errors++;
@@ -246,7 +246,7 @@ static ssize_t ssl_sendmsg(conn *c, struct msghdr *msg, int flags) {
     // conn_worker_readd.
     // Currently this connection would not be served by a different thread
     // than the one it's assigned.
-    assert(pthread_equal(c->thread->thread_id, pthread_self()) != 0);
+    assert(pthread_equal(worker_me->thread_id, pthread_self()) != 0);
 
     char *bp = c->ssl_wbuf;
     for (i = 0; i < msg->msg_iovlen; i++) {

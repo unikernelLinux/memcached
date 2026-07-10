@@ -36,6 +36,7 @@
 #include <pwd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <sys/timerfd.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -52,6 +53,7 @@
 #endif
 
 #include "tls.h"
+#include "../../libupcall/upcall.h"
 
 #include "proto_text.h"
 #include "proto_bin.h"
@@ -65,7 +67,6 @@
  * forward declarations
  */
 static void drive_machine(conn *c);
-static int new_socket(struct addrinfo *ai);
 static ssize_t tcp_read(conn *arg, void *buf, size_t count);
 static ssize_t tcp_sendmsg(conn *arg, struct msghdr *msg, int flags);
 static ssize_t tcp_write(conn *arg, void *buf, size_t count);
@@ -80,7 +81,6 @@ enum try_read_result {
 static int try_read_command_negotiate(conn *c);
 static int try_read_command_udp(conn *c);
 
-static enum try_read_result try_read_network(conn *c);
 static enum try_read_result try_read_udp(conn *c);
 
 static int start_conn_timeout_thread(void);
@@ -93,12 +93,9 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr);
 static void settings_init(void);
 
 /* event handling, network IO */
-static void event_handler(const evutil_socket_t fd, const short which, void *arg);
 static void conn_close(conn *c);
 static void conn_init(void);
-static bool update_event(conn *c, const int new_flags);
 static void complete_nread(conn *c);
-
 static void conn_free(conn *c);
 
 /** exported globals **/
@@ -117,7 +114,6 @@ void *ext_storage = NULL;
 /** file scope variables **/
 static conn *listen_conn = NULL;
 static int max_fds;
-static struct event_base *main_base;
 
 enum transmit_result {
     TRANSMIT_COMPLETE,   /** All done writing. */
@@ -151,20 +147,6 @@ static enum transmit_result transmit(conn *c);
  */
 static volatile bool allow_new_conns = true;
 static int stop_main_loop = NOT_STOP;
-static struct event maxconnsevent;
-static void maxconns_handler(const evutil_socket_t fd, const short which, void *arg) {
-    struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
-
-    if (fd == -42 || allow_new_conns == false) {
-        /* reschedule in 10ms if we need to keep polling */
-        evtimer_set(&maxconnsevent, maxconns_handler, 0);
-        event_base_set(main_base, &maxconnsevent);
-        evtimer_add(&maxconnsevent, &t);
-    } else {
-        evtimer_del(&maxconnsevent);
-        accept_new_conns(true);
-    }
-}
 
 /*
  * given time value that's either unix time or delta from current unix time, return
@@ -327,7 +309,7 @@ static void *conn_timeout_thread(void *arg) {
                 continue;
 
             if ((current_time - c->last_cmd_time) > settings.idle_timeout) {
-                timeout_conn(c);
+                conn_close_idle(c);
             } else {
                 if (c->last_cmd_time < oldest_last_cmd)
                     oldest_last_cmd = c->last_cmd_time;
@@ -395,7 +377,7 @@ static void rbuf_release(conn *c) {
             free(c->rbuf);
             c->rbuf_malloced = false;
         } else {
-            do_cache_free(c->thread->rbuf_cache, c->rbuf);
+            cache_free(worker_me->rbuf_cache, c->rbuf);
         }
         c->rsize = 0;
         c->rbuf = NULL;
@@ -405,11 +387,11 @@ static void rbuf_release(conn *c) {
 
 static bool rbuf_alloc(conn *c) {
     if (c->rbuf == NULL) {
-        c->rbuf = do_cache_alloc(c->thread->rbuf_cache);
+        c->rbuf = cache_alloc(worker_me->rbuf_cache);
         if (!c->rbuf) {
-            THR_STATS_LOCK(c->thread);
-            c->thread->stats.read_buf_oom++;
-            THR_STATS_UNLOCK(c->thread);
+            THR_STATS_LOCK(worker_me);
+            worker_me->stats.read_buf_oom++;
+            THR_STATS_UNLOCK(worker_me);
             return false;
         }
         c->rsize = READ_BUFFER_SIZE;
@@ -429,7 +411,7 @@ bool rbuf_switch_to_malloc(conn *c) {
         return false;
 
     memcpy(tmp, c->rcurr, c->rbytes);
-    do_cache_free(c->thread->rbuf_cache, c->rbuf);
+    cache_free(worker_me->rbuf_cache, c->rbuf);
 
     c->rcurr = c->rbuf = tmp;
     c->rsize = size;
@@ -510,9 +492,9 @@ void conn_close_idle(conn *c) {
         if (settings.verbose > 1)
             fprintf(stderr, "Closing idle fd %d\n", c->sfd);
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.idle_kicks++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCK();
+        stats_state.idle_kicks++;
+        STATS_UNLOCK();
 
         c->close_reason = IDLE_TIMEOUT_CLOSE;
 
@@ -521,96 +503,27 @@ void conn_close_idle(conn *c) {
     }
 }
 
-static void _conn_event_readd(conn *c) {
-    c->ev_flags = EV_READ | EV_PERSIST;
-    event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
-    event_base_set(c->thread->base, &c->event);
-
-    // TODO: call conn_cleanup/fail/etc
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-    }
-}
-
-/* bring conn back from a sidethread. could have had its event base moved. */
+/* bring conn back from a sidethread. */
 void conn_worker_readd(conn *c) {
-    assert(c->resps_suspended == 0); // TODO: remove assert.
-
     switch (c->state) {
         case conn_closing:
             drive_machine(c);
             break;
-        case conn_io_pending:
-            // The event listener was removed as more data showed up while
-            // waiting for the async response.
-            _conn_event_readd(c);
-            // Explicit fall-through.
-        case conn_io_queue:
-            conn_set_state(c, conn_io_resume);
-            // schedule the event, which just runs drive_machine outside of
-            // any recursion here.
-            event_active(&c->event, 0, 0);
-            break;
         case conn_nread:
-            // ran IO queue while waiting for set payload.
         case conn_write:
         case conn_mwrite:
         case conn_read:
         case conn_parse_cmd:
-            // No-ops if we weren't in a suspended state to begin with
-            // TODO: which other states for this?
             break;
         default:
-            event_del(&c->event);
-            _conn_event_readd(c);
             conn_set_state(c, conn_new_cmd);
     }
-
 }
 
-void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb) {
-    io_queue_t *q = t->io_queues;
-    while (q->type != IO_QUEUE_NONE) {
-        q++;
-    }
-    q->type = type;
-    q->ctx = ctx;
-    q->submit_cb = cb;
-    STAILQ_INIT(&q->stack);
-    return;
-}
-
-io_queue_t *thread_io_queue_get(LIBEVENT_THREAD *t, int type) {
-    io_queue_t *q = t->io_queues;
-    while (q->type != IO_QUEUE_NONE) {
-        if (q->type == type) {
-            return q;
-        }
-        q++;
-    }
-    return NULL;
-}
-
-void thread_io_queue_submit(LIBEVENT_THREAD *t) {
-    t->conns_tosubmit = 0;
-    for (io_queue_t *q = t->io_queues; q->type != IO_QUEUE_NONE; q++) {
-        // submission callback must consume the queue
-        if (!STAILQ_EMPTY(&q->stack)) {
-            q->submit_cb(q);
-            assert(STAILQ_EMPTY(&q->stack));
-        }
-    }
-}
-
-// called to return a single IO object to the original worker thread.
-void conn_io_queue_return(io_pending_t *io) {
-    io->return_cb(io);
-}
 
 conn *conn_new(const int sfd, enum conn_states init_state,
-                const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
-                struct event_base *base, void *ssl, uint64_t conntag,
+                void *ssl, uint64_t conntag,
                 enum protocol bproto) {
     conn *c;
 
@@ -710,14 +623,21 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->rlbytes = 0;
     c->cmd = -1;
     c->rbytes = 0;
+    /* If a previously-grown malloc'd rbuf was left on this conn struct (from
+     * a stuck connection that was never properly closed), free it now so we
+     * don't pass a malloc'd pointer to cache_free later. */
+    if (c->rbuf_malloced && c->rbuf != NULL) {
+        free(c->rbuf);
+        c->rbuf = NULL;
+    }
     c->rcurr = c->rbuf;
     c->ritem = 0;
     c->rbuf_malloced = false;
+    c->open_bundle = NULL;
     c->item_malloced = false;
     c->sasl_started = false;
     c->close_after_write = false;
     c->last_cmd_time = current_time; /* initialize for idle kicker */
-    assert(c->resps_suspended == 0);
 
     c->item = 0;
     c->ssl = NULL;
@@ -764,15 +684,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 break;
 #endif
         }
-    }
-
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
-
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-        return NULL;
     }
 
     STATS_LOCK();
@@ -864,14 +775,11 @@ void conn_free(conn *c) {
 static void conn_close(conn *c) {
     assert(c != NULL);
 
-    if (c->thread) {
-        LOGGER_LOG(c->thread->l, LOG_CONNEVENTS, LOGGER_CONNECTION_CLOSE, NULL,
+    if (worker_me) {
+        LOGGER_LOG(worker_me->l, LOG_CONNEVENTS, LOGGER_CONNECTION_CLOSE, NULL,
                 &c->request_addr, c->request_addr_size, c->transport,
                 c->close_reason, c->sfd);
     }
-
-    /* delete the event, the socket and the conn */
-    event_del(&c->event);
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
@@ -879,7 +787,7 @@ static void conn_close(conn *c) {
     conn_cleanup(c);
 
     // force release of read buffer.
-    if (c->thread) {
+    if (worker_me) {
         c->rbytes = 0;
         rbuf_release(c);
     }
@@ -929,10 +837,7 @@ static const char *state_text(enum conn_states state) {
                                        "conn_closing",
                                        "conn_mwrite",
                                        "conn_closed",
-                                       "conn_watch",
-                                       "conn_io_queue",
-                                       "conn_io_resume",
-                                       "conn_io_pending" };
+                                       "conn_watch" };
     return statenames[state];
 }
 
@@ -1009,9 +914,9 @@ void resp_add_chunked_iov(mc_resp *resp, const void *buf, int len) {
 // track a single memory limit for ephemeral connection buffers.
 // Fancy bit twiddling tricks are avoided to help keep this straightforward.
 static mc_resp* resp_allocate(conn *c) {
-    LIBEVENT_THREAD *th = c->thread;
+    LIBEVENT_THREAD *th = worker_me;
     mc_resp *resp = NULL;
-    mc_resp_bundle *b = th->open_bundle;
+    mc_resp_bundle *b = c->open_bundle;
 
     if (b != NULL) {
         for (int i = 0; i < MAX_RESP_PER_BUNDLE; i++) {
@@ -1032,7 +937,7 @@ static mc_resp* resp_allocate(conn *c) {
             if (b->refcount == MAX_RESP_PER_BUNDLE) {
                 assert(b->prev == NULL);
                 // We only allocate off the head. Assign new head.
-                th->open_bundle = b->next;
+                c->open_bundle = b->next;
                 // Remove ourselves from the list.
                 if (b->next) {
                     b->next->prev = 0;
@@ -1043,8 +948,7 @@ static mc_resp* resp_allocate(conn *c) {
     }
 
     if (resp == NULL) {
-        assert(th->open_bundle == NULL);
-        b = do_cache_alloc(th->rbuf_cache);
+        b = cache_alloc(th->rbuf_cache);
         if (b) {
             THR_STATS_LOCK(th);
             th->stats.response_obj_bytes += READ_BUFFER_SIZE;
@@ -1056,8 +960,7 @@ static mc_resp* resp_allocate(conn *c) {
             }
             b->next = 0;
             b->prev = 0;
-            b->thread = th;
-            th->open_bundle = b;
+            c->open_bundle = b;
             resp = &b->r[0];
             memset(resp, 0, sizeof(*resp));
             resp->free = false; // redundant. for clarity.
@@ -1070,22 +973,23 @@ static mc_resp* resp_allocate(conn *c) {
     return resp;
 }
 
-void resp_free(LIBEVENT_THREAD *th, mc_resp *resp) {
+void resp_free(conn *c, mc_resp *resp) {
+    LIBEVENT_THREAD *th = worker_me;
     mc_resp_bundle *b = resp->bundle;
 
     resp->free = true;
     b->refcount--;
     if (b->refcount == 0) {
-        if (b == th->open_bundle && b->next == 0) {
+        if (b == c->open_bundle && b->next == 0) {
             // This is the final bundle. Just hold and reuse to skip init loop
             assert(b->prev == 0);
             b->next_check = 0;
         } else {
             // Assert that we're either in the list or at the head.
-            assert((b->next || b->prev) || b == th->open_bundle);
+            assert((b->next || b->prev) || b == c->open_bundle);
 
             // unlink from list.
-            mc_resp_bundle **head = &th->open_bundle;
+            mc_resp_bundle **head = &c->open_bundle;
             if (*head == b) *head = b->next;
             // Not tracking the tail.
             assert(b->next != b && b->prev != b);
@@ -1094,15 +998,15 @@ void resp_free(LIBEVENT_THREAD *th, mc_resp *resp) {
             if (b->prev) b->prev->next = b->next;
 
             // Now completely done with this buffer.
-            do_cache_free(th->rbuf_cache, b);
+            cache_free(th->rbuf_cache, b);
             THR_STATS_LOCK(th);
             th->stats.response_obj_bytes -= READ_BUFFER_SIZE;
             THR_STATS_UNLOCK(th);
         }
     } else {
-        mc_resp_bundle **head = &th->open_bundle;
+        mc_resp_bundle **head = &c->open_bundle;
         // NOTE: since we're not tracking tail, latest free ends up in head.
-        if (b == th->open_bundle || (b->prev || b->next)) {
+        if (b == c->open_bundle || (b->prev || b->next)) {
             // If we're already linked, leave it in place to save CPU.
         } else {
             // Non-zero refcount, need to link into the freelist.
@@ -1121,16 +1025,16 @@ void resp_free(LIBEVENT_THREAD *th, mc_resp *resp) {
 bool resp_start(conn *c) {
     mc_resp *resp = resp_allocate(c);
     if (!resp) {
-        THR_STATS_LOCK(c->thread);
-        c->thread->stats.response_obj_oom++;
-        THR_STATS_UNLOCK(c->thread);
+        THR_STATS_LOCK(worker_me);
+        worker_me->stats.response_obj_oom++;
+        THR_STATS_UNLOCK(worker_me);
         return false;
     }
 
     // handling the stats counters here to simplify testing
-    THR_STATS_LOCK(c->thread);
-    c->thread->stats.response_obj_count++;
-    THR_STATS_UNLOCK(c->thread);
+    THR_STATS_LOCK(worker_me);
+    worker_me->stats.response_obj_count++;
+    THR_STATS_UNLOCK(worker_me);
 
     if (!c->resp_head) {
         c->resp_head = resp;
@@ -1153,16 +1057,16 @@ bool resp_start(conn *c) {
 mc_resp *resp_start_unlinked(conn *c) {
     mc_resp *resp = resp_allocate(c);
     if (!resp) {
-        THR_STATS_LOCK(c->thread);
-        c->thread->stats.response_obj_oom++;
-        THR_STATS_UNLOCK(c->thread);
+        THR_STATS_LOCK(worker_me);
+        worker_me->stats.response_obj_oom++;
+        THR_STATS_UNLOCK(worker_me);
         return false;
     }
 
     // handling the stats counters here to simplify testing
-    THR_STATS_LOCK(c->thread);
-    c->thread->stats.response_obj_count++;
-    THR_STATS_UNLOCK(c->thread);
+    THR_STATS_LOCK(worker_me);
+    worker_me->stats.response_obj_count++;
+    THR_STATS_UNLOCK(worker_me);
 
     if (IS_UDP(c->transport)) {
         // need to hold on to some data for async responses.
@@ -1191,21 +1095,13 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
 #endif
         free(resp->write_and_free);
     }
-    if (resp->io_pending) {
-        io_pending_t *io = resp->io_pending;
-        // If we had a pending IO, tell it to internally clean up then return
-        // the main object back to our thread cache.
-        io->finalize_cb(io);
-        do_cache_free(c->thread->io_cache, io);
-        resp->io_pending = NULL;
-    }
     if (c->resp_head == resp) {
         c->resp_head = next;
     }
     if (c->resp == resp) {
         c->resp = NULL;
     }
-    resp_free(c->thread, resp);
+    resp_free(c, resp);
     return next;
 }
 
@@ -1763,7 +1659,6 @@ void server_stats(ADD_STAT add_stats, void *c) {
     APPEND_STAT("uptime", "%u", now - ITEM_UPDATE_INTERVAL);
     APPEND_STAT("time", "%ld", now + (long)process_started);
     APPEND_STAT("version", "%s", VERSION);
-    APPEND_STAT("libevent", "%s", event_get_version());
     APPEND_STAT("pointer_size", "%d", (int)(8 * sizeof(void *)));
 
 #ifndef WIN32
@@ -1833,7 +1728,7 @@ void server_stats(ADD_STAT add_stats, void *c) {
     APPEND_STAT("auth_cmds", "%llu", (unsigned long long)thread_stats.auth_cmds);
     APPEND_STAT("auth_errors", "%llu", (unsigned long long)thread_stats.auth_errors);
     if (settings.idle_timeout) {
-        APPEND_STAT("idle_kicks", "%llu", (unsigned long long)thread_stats.idle_kicks);
+        APPEND_STAT("idle_kicks", "%llu", (unsigned long long)stats_state.idle_kicks);
     }
     APPEND_STAT("bytes_read", "%llu", (unsigned long long)thread_stats.bytes_read);
     APPEND_STAT("bytes_written", "%llu", (unsigned long long)thread_stats.bytes_written);
@@ -1893,8 +1788,6 @@ void server_stats(ADD_STAT add_stats, void *c) {
         APPEND_STAT("time_since_server_cert_refresh", "%u", now - settings.ssl_last_cert_refresh_time);
     }
 #endif
-    APPEND_STAT("unexpected_napi_ids", "%llu", (unsigned long long)stats.unexpected_napi_ids);
-    APPEND_STAT("round_robin_fallback", "%llu", (unsigned long long)stats.round_robin_fallback);
 }
 
 void process_stat_settings(ADD_STAT add_stats, void *c) {
@@ -2172,9 +2065,6 @@ void process_stats_conns(ADD_STAT add_stats, void *c) {
                 }
                 APPEND_NUM_STAT(i, "state", "%s",
                         state_text(sc->state));
-                if (sc->resps_suspended) {
-                    APPEND_NUM_STAT(i, "resps_waiting", "%d", sc->resps_suspended);
-                }
                 APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
                         current_time - sc->last_cmd_time);
             }
@@ -2393,9 +2283,9 @@ static enum try_read_result try_read_udp(conn *c) {
                    &c->request_addr_size);
     if (res > 8) {
         unsigned char *buf = (unsigned char *)c->rbuf;
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.bytes_read += res;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.bytes_read += res;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
 
         /* Beginning of UDP packet is the request ID; save it. */
         c->request_id = buf[0] * 256 + buf[1];
@@ -2416,96 +2306,6 @@ static enum try_read_result try_read_udp(conn *c) {
     return READ_NO_DATA_RECEIVED;
 }
 
-/*
- * read from network as much as we can, handle buffer overflow and connection
- * close.
- * before reading, move the remaining incomplete fragment of a command
- * (if any) to the beginning of the buffer.
- *
- * To protect us from someone flooding a connection with bogus data causing
- * the connection to eat up all available memory, break out and start looking
- * at the data I've got after a number of reallocs...
- *
- * @return enum try_read_result
- */
-static enum try_read_result try_read_network(conn *c) {
-    enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
-    int res;
-    int num_allocs = 0;
-    assert(c != NULL);
-
-    if (c->rcurr != c->rbuf) {
-        if (c->rbytes > 0) /* otherwise there's nothing to copy */
-            memmove(c->rbuf, c->rcurr, c->rbytes);
-        c->rcurr = c->rbuf;
-    }
-
-    while (1) {
-        // TODO: move to rbuf_* func?
-        if (c->rbytes >= c->rsize && c->rbuf_malloced) {
-            if (num_allocs == 4) {
-                return gotdata;
-            }
-            ++num_allocs;
-            char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
-            if (!new_rbuf) {
-                STATS_LOCK();
-                stats.malloc_fails++;
-                STATS_UNLOCK();
-                if (settings.verbose > 0) {
-                    fprintf(stderr, "Couldn't realloc input buffer\n");
-                }
-                c->rbytes = 0; /* ignore what we read */
-                out_of_memory(c, "SERVER_ERROR out of memory reading request");
-                c->close_after_write = true;
-                return READ_MEMORY_ERROR;
-            }
-            c->rcurr = c->rbuf = new_rbuf;
-            c->rsize *= 2;
-        }
-
-        int avail = c->rsize - c->rbytes;
-        res = c->read(c, c->rbuf + c->rbytes, avail);
-        if (res > 0) {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.bytes_read += res;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
-            gotdata = READ_DATA_RECEIVED;
-            c->rbytes += res;
-            if (res == avail && c->rbuf_malloced) {
-                // Resize rbuf and try a few times if huge ascii multiget.
-                continue;
-            } else {
-                break;
-            }
-        }
-        if (res == 0) {
-            c->close_reason = NORMAL_CLOSE;
-            return READ_ERROR;
-        }
-        if (res == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            return READ_ERROR;
-        }
-    }
-    return gotdata;
-}
-
-static bool update_event(conn *c, const int new_flags) {
-    assert(c != NULL);
-
-    struct event_base *base = c->event.ev_base;
-    if (c->ev_flags == new_flags)
-        return true;
-    if (event_del(&c->event) == -1) return false;
-    event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = new_flags;
-    if (event_add(&c->event, 0) == -1) return false;
-    return true;
-}
 
 /*
  * Sets whether we are listening for new connections or not.
@@ -2515,13 +2315,10 @@ void do_accept_new_conns(const bool do_accept) {
 
     for (next = listen_conn; next; next = next->next) {
         if (do_accept) {
-            update_event(next, EV_READ | EV_PERSIST);
             if (listen(next->sfd, settings.backlog) != 0) {
                 perror("listen");
             }
-        }
-        else {
-            update_event(next, 0);
+        } else {
             if (listen(next->sfd, 0) != 0) {
                 perror("listen");
             }
@@ -2546,7 +2343,6 @@ void do_accept_new_conns(const bool do_accept) {
         stats.listen_disabled_num++;
         STATS_UNLOCK();
         allow_new_conns = false;
-        maxconns_handler(-42, 0, 0);
     }
 }
 
@@ -2683,56 +2479,17 @@ static void _transmit_post(conn *c, ssize_t res) {
 static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
     struct iovec iovs[IOV_MAX];
-    struct msghdr msg;
     int iovused = 0;
-
-    // init the msg.
-    memset(&msg, 0, sizeof(struct msghdr));
-    msg.msg_iov = iovs;
 
     iovused = _transmit_pre(c, iovs, iovused, TRANSMIT_ALL_RESP);
     if (iovused == 0) {
-        // Avoid the syscall if we're only handling a noreply.
-        // Return the response object.
+        // All responses are noreply/skip; no I/O needed.
         _transmit_post(c, 0);
         return TRANSMIT_COMPLETE;
     }
 
-    // Alright, send.
-    ssize_t res;
-    msg.msg_iovlen = iovused;
-    res = c->sendmsg(c, &msg, 0);
-    if (res >= 0) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.bytes_written += res;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        // Decrement any partial IOV's and complete any finished resp's.
-        _transmit_post(c, res);
-
-        if (c->resp_head) {
-            return TRANSMIT_INCOMPLETE;
-        } else {
-            return TRANSMIT_COMPLETE;
-        }
-    }
-
-    if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
-            conn_set_state(c, conn_closing);
-            return TRANSMIT_HARD_ERROR;
-        }
-        return TRANSMIT_SOFT_ERROR;
-    }
-    /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
-       we have a real error, on which we close the connection */
-    if (settings.verbose > 0)
-        perror("Failed to write, and not due to blocking");
-
-    conn_set_state(c, conn_closing);
-    return TRANSMIT_HARD_ERROR;
+    // Defer to issue_write / add_write for all actual socket sends.
+    return TRANSMIT_SOFT_ERROR;
 }
 
 static void build_udp_header(unsigned char *hdr, mc_resp *resp) {
@@ -2839,9 +2596,9 @@ static enum transmit_result transmit_udp(conn *c) {
     // NOTE: uses system sendmsg since we have no support for indirect UDP.
     res = sendmsg(c->sfd, &msg, 0);
     if (res >= 0) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.bytes_written += res;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        pthread_mutex_lock(&worker_me->stats.mutex);
+        worker_me->stats.bytes_written += res;
+        pthread_mutex_unlock(&worker_me->stats.mutex);
 
         // Ignore the header size from forwarding the IOV's
         res -= UDP_HEADER_SIZE;
@@ -2857,12 +2614,6 @@ static enum transmit_result transmit_udp(conn *c) {
     }
 
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
-            conn_set_state(c, conn_closing);
-            return TRANSMIT_HARD_ERROR;
-        }
         return TRANSMIT_SOFT_ERROR;
     }
     /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
@@ -2881,7 +2632,6 @@ static enum transmit_result transmit_udp(conn *c) {
  */
 static int read_into_chunked_item(conn *c) {
     int total = 0;
-    int res;
     assert(c->rcurr != c->ritem);
 
     while (c->rlbytes > 0) {
@@ -2923,21 +2673,10 @@ static int read_into_chunked_item(conn *c) {
                 break;
             }
         } else {
-            /*  now try reading from the socket */
-            res = c->read(c, ch->data + ch->used,
-                    (unused > c->rlbytes ? c->rlbytes : unused));
-            if (res > 0) {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.bytes_read += res;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                ch->used += res;
-                total += res;
-                c->rlbytes -= res;
-            } else {
-                /* Reset total to the latest result so caller can handle it */
-                total = res;
-                break;
-            }
+            /* No more data in rbuf; signal EAGAIN so conn_nread re-arms add_read. */
+            errno = EAGAIN;
+            total = -1;
+            break;
         }
     }
 
@@ -2958,19 +2697,172 @@ static int read_into_chunked_item(conn *c) {
     return total;
 }
 
+/*
+ * Called by the upcall layer when a read completes on a connection fd.
+ * Injects received data into the connection's command buffer and drives
+ * the state machine.  Both conn_nread and conn_swallow drain from rbuf
+ * into their own destinations, so we always land data here.
+ */
+void read_handler(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+    int nbytes = evt->result;
+
+    if (c == NULL) {
+        return_buffer(evt->buf, upcall_buf_sz());
+        return;
+    }
+
+    if (nbytes == 0) {
+        c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        return_buffer(evt->buf, upcall_buf_sz());
+        drive_machine(c);
+        return;
+    }
+    if (nbytes < 0) {
+        conn_set_state(c, conn_closing);
+        return_buffer(evt->buf, upcall_buf_sz());
+        drive_machine(c);
+        return;
+    }
+
+    if (!rbuf_alloc(c)) {
+        conn_set_state(c, conn_closing);
+        return_buffer(evt->buf, upcall_buf_sz());
+        drive_machine(c);
+        return;
+    }
+
+    if ((c->rcurr - c->rbuf) + c->rbytes + nbytes > c->rsize) {
+        /* Compact: reclaim dead space before rcurr. */
+        if (c->rcurr != c->rbuf) {
+            if (c->rbytes)
+                memmove(c->rbuf, c->rcurr, c->rbytes);
+            c->rcurr = c->rbuf;
+        }
+
+        if (c->rbytes + nbytes > c->rsize) {
+            size_t newsize = c->rsize * 2;
+            while (newsize < c->rbytes + nbytes)
+                newsize *= 2;
+
+            char *newbuf;
+            if (c->rbuf_malloced) {
+                newbuf = realloc(c->rbuf, newsize);
+            } else {
+                newbuf = malloc(newsize);
+                if (newbuf && c->rbytes)
+                    memcpy(newbuf, c->rbuf, c->rbytes);
+                if (newbuf) {
+                    cache_free(worker_me->rbuf_cache, c->rbuf);
+                    c->rbuf_malloced = true;
+                }
+            }
+
+            if (!newbuf) {
+                conn_set_state(c, conn_closing);
+                return_buffer(evt->buf, upcall_buf_sz());
+                drive_machine(c);
+                return;
+            }
+            c->rcurr = c->rbuf = newbuf;
+            c->rsize = newsize;
+        }
+    }
+
+    memcpy(c->rcurr + c->rbytes, evt->buf, nbytes);
+    c->rbytes += nbytes;
+    return_buffer(evt->buf, upcall_buf_sz());
+
+    THR_STATS_LOCK(worker_me);
+    worker_me->stats.bytes_read += nbytes;
+    THR_STATS_UNLOCK(worker_me);
+
+    drive_machine(c);
+}
+
+void write_handler(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+
+    free(evt->buf);
+
+    if (c == NULL)
+        return;
+
+    if (evt->result < 0) {
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    THR_STATS_LOCK(worker_me);
+    worker_me->stats.bytes_written += evt->result;
+    THR_STATS_UNLOCK(worker_me);
+
+    _transmit_post(c, evt->result);
+    drive_machine(c);
+}
+
+void udp_read_handler(struct up_event *evt) {
+    conn *c = conns[evt->fd];
+
+    /* add_read consumed a datagram into evt->buf without the source address.
+     * Discard it; try_read_udp calls recvfrom directly to get both data and
+     * source address. */
+    return_buffer(evt->buf, upcall_buf_sz());
+
+    if (c == NULL) {
+        add_read(evt->fd, udp_read_handler);
+        return;
+    }
+
+    if (try_read_udp(c) == READ_DATA_RECEIVED) {
+        conn_set_state(c, conn_parse_cmd);
+        drive_machine(c);
+        /* drive_machine reaches conn_waiting or conn_closing, both of which
+         * re-arm add_read for UDP. */
+    } else {
+        /* No data (add_read consumed the only pending datagram): re-arm. */
+        add_read(evt->fd, udp_read_handler);
+    }
+}
+
+static void issue_write(conn *c) {
+    struct iovec iovs[IOV_MAX];
+    int iovused, i;
+    size_t total = 0;
+    char *buf, *p;
+
+    iovused = _transmit_pre(c, iovs, 0, TRANSMIT_ALL_RESP);
+    if (iovused == 0) {
+        _transmit_post(c, 0);
+        drive_machine(c);
+        return;
+    }
+
+    for (i = 0; i < iovused; i++)
+        total += iovs[i].iov_len;
+
+    buf = malloc(total);
+    if (!buf) {
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+        return;
+    }
+
+    p = buf;
+    for (i = 0; i < iovused; i++) {
+        memcpy(p, iovs[i].iov_base, iovs[i].iov_len);
+        p += iovs[i].iov_len;
+    }
+
+    add_write(c->sfd, buf, total, write_handler);
+}
+
 static void drive_machine(conn *c) {
     bool stop = false;
-    int sfd;
-    socklen_t addrlen;
-    struct sockaddr_storage addr;
     int nreqs = settings.reqs_per_event;
     int res;
-    const char *str;
-#ifdef HAVE_ACCEPT4
-    static int  use_accept4 = 1;
-#else
-    static int  use_accept4 = 0;
-#endif
 
     assert(c != NULL);
 
@@ -2978,116 +2870,44 @@ static void drive_machine(conn *c) {
 
         switch(c->state) {
         case conn_listening:
-            addrlen = sizeof(addr);
-#ifdef HAVE_ACCEPT4
-            if (use_accept4) {
-                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
-            } else {
-                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-            }
-#else
-            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-#endif
-            if (sfd == -1) {
-                if (use_accept4 && errno == ENOSYS) {
-                    use_accept4 = 0;
-                    continue;
-                }
-                perror(use_accept4 ? "accept4()" : "accept()");
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* these are transient, so don't log anything */
-                    stop = true;
-                } else if (errno == EMFILE) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Too many open connections\n");
-                    accept_new_conns(false);
-                    stop = true;
-                } else {
-                    perror("accept()");
-                    stop = true;
-                }
-                break;
-            }
-            if (!use_accept4) {
-                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
-                    perror("setting O_NONBLOCK");
-                    close(sfd);
-                    break;
-                }
-            }
-
-            bool reject;
-            if (settings.maxconns_fast) {
-                reject = sfd >= settings.maxconns - 1;
-                if (reject) {
-                    STATS_LOCK();
-                    stats.rejected_conns++;
-                    STATS_UNLOCK();
-                }
-            } else {
-                reject = false;
-            }
-
-            if (reject) {
-                str = "ERROR Too many open connections\r\n";
-                res = write(sfd, str, strlen(str));
-                close(sfd);
-            } else {
-                // run accept routine if ssl is compiled + enabled
-                bool fail = false;
-                void *ssl_v = ssl_accept(c, sfd, &fail);
-                if (fail) {
-                    close(sfd);
-                    break;
-                }
-
-                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
-            }
-
-            stop = true;
-            break;
+            /* Unreachable in upcall model: accept is handled by accept_handler
+             * registered via add_accept in worker_listen. */
+            abort();
 
         case conn_waiting:
             rbuf_release(c);
-            if (!update_event(c, EV_READ | EV_PERSIST)) {
-                if (settings.verbose > 0)
-                    fprintf(stderr, "Couldn't update event\n");
-                conn_set_state(c, conn_closing);
-                break;
-            }
-
+            add_read(c->sfd, IS_UDP(c->transport) ? udp_read_handler : read_handler);
             conn_set_state(c, conn_read);
             stop = true;
             break;
 
         case conn_read:
-            if (!IS_UDP(c->transport)) {
-                // Assign a read buffer if necessary.
+            if (IS_UDP(c->transport)) {
+                res = try_read_udp(c);
+                switch (res) {
+                case READ_NO_DATA_RECEIVED:
+                    conn_set_state(c, conn_waiting);
+                    break;
+                case READ_DATA_RECEIVED:
+                    conn_set_state(c, conn_parse_cmd);
+                    break;
+                case READ_ERROR:
+                    conn_set_state(c, conn_closing);
+                    break;
+                case READ_MEMORY_ERROR:
+                    break;
+                }
+            } else {
                 if (!rbuf_alloc(c)) {
-                    // TODO: Some way to allow for temporary failures.
                     conn_set_state(c, conn_closing);
                     break;
                 }
-                res = try_read_network(c);
-            } else {
-                // UDP connections always have a static buffer.
-                res = try_read_udp(c);
-            }
-
-            switch (res) {
-            case READ_NO_DATA_RECEIVED:
-                conn_set_state(c, conn_waiting);
-                break;
-            case READ_DATA_RECEIVED:
-                conn_set_state(c, conn_parse_cmd);
-                break;
-            case READ_ERROR:
-                conn_set_state(c, conn_closing);
-                break;
-            case READ_MEMORY_ERROR: /* Failed to allocate more memory */
-                /* State already set by try_read_network */
-                break;
+                if (c->rbytes > 0) {
+                    conn_set_state(c, conn_parse_cmd);
+                } else {
+                    add_read(c->sfd, read_handler);
+                    stop = true;
+                }
             }
             break;
 
@@ -3115,24 +2935,13 @@ static void drive_machine(conn *c) {
                 // flush response pipe on yield.
                 conn_set_state(c, conn_mwrite);
             } else {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.conn_yields++;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                if (c->rbytes > 0) {
-                    /* We have already read in data into the input buffer,
-                       so libevent will most likely not signal read events
-                       on the socket (unless more data is available. As a
-                       hack we should just put in a request to write data,
-                       because that should be possible ;-)
-                    */
-                    if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-                        if (settings.verbose > 0)
-                            fprintf(stderr, "Couldn't update event\n");
-                        conn_set_state(c, conn_closing);
-                        break;
-                    }
-                }
-                stop = true;
+                pthread_mutex_lock(&worker_me->stats.mutex);
+                worker_me->stats.conn_yields++;
+                pthread_mutex_unlock(&worker_me->stats.mutex);
+                /* Transition to conn_waiting so a read event is registered.
+                 * Without this, noreply workloads would leave the connection
+                 * permanently stuck with no event registered. */
+                conn_set_state(c, conn_waiting);
             }
             break;
 
@@ -3165,19 +2974,10 @@ static void drive_machine(conn *c) {
                     }
                 }
 
-                /*  now try reading from the socket */
-                res = c->read(c, c->ritem, c->rlbytes);
-                if (res > 0) {
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.bytes_read += res;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-                    if (c->rcurr == c->ritem) {
-                        c->rcurr += res;
-                    }
-                    c->ritem += res;
-                    c->rlbytes -= res;
-                    break;
-                }
+                /* No more data in rbuf; wait for next read_handler to refill. */
+                add_read(c->sfd, read_handler);
+                stop = true;
+                break;
             } else {
                 res = read_into_chunked_item(c);
                 if (res > 0)
@@ -3191,12 +2991,7 @@ static void drive_machine(conn *c) {
             }
 
             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
+                add_read(c->sfd, read_handler);
                 stop = true;
                 break;
             }
@@ -3236,56 +3031,13 @@ static void drive_machine(conn *c) {
                 break;
             }
 
-            /*  now try reading from the socket */
-            res = c->read(c, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
-            if (res > 0) {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.bytes_read += res;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                c->sbytes -= res;
-                break;
-            }
-            if (res == 0) { /* end of stream */
-                c->close_reason = NORMAL_CLOSE;
-                conn_set_state(c, conn_closing);
-                break;
-            }
-            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
-                stop = true;
-                break;
-            }
-            /* otherwise we have a real error, on which we close the connection */
-            if (settings.verbose > 0)
-                fprintf(stderr, "Failed to read, and not due to blocking\n");
-            conn_set_state(c, conn_closing);
+            /* No more data in rbuf; wait for next read_handler to refill. */
+            add_read(c->sfd, read_handler);
+            stop = true;
             break;
 
         case conn_write:
         case conn_mwrite:
-            /* have side IO's that must process before transmit() can run.
-             * remove the connection from the worker thread and dispatch the
-             * IO queue
-             */
-            if (c->resps_suspended) {
-                LIBEVENT_THREAD *t = c->thread;
-                // FIXME: carefully check or document somewhere that submit
-                // cannot resume a connection in-line with submission.
-                conn_set_state(c, conn_io_queue);
-                if (t->conns_tosubmit++ > 20) {
-                    // Run occasional batches, else submit outside event loop.
-                    thread_io_queue_submit(c->thread);
-                }
-
-                stop = true;
-                break;
-            }
-
             switch (!IS_UDP(c->transport) ? transmit(c) : transmit_udp(c)) {
             case TRANSMIT_COMPLETE:
                 if (c->state == conn_mwrite) {
@@ -3307,17 +3059,18 @@ static void drive_machine(conn *c) {
                 break;                   /* Continue in state machine. */
 
             case TRANSMIT_SOFT_ERROR:
+                issue_write(c);
                 stop = true;
                 break;
             }
             break;
 
         case conn_closing:
-            if (!c->resps_suspended) {
-                if (IS_UDP(c->transport))
-                    conn_cleanup(c);
-                else
-                    conn_close(c);
+            if (IS_UDP(c->transport)) {
+                conn_cleanup(c);
+                add_read(c->sfd, udp_read_handler);
+            } else {
+                conn_close(c);
             }
             stop = true;
             break;
@@ -3331,20 +3084,6 @@ static void drive_machine(conn *c) {
             /* We handed off our connection to the logger thread. */
             stop = true;
             break;
-        case conn_io_queue:
-            /* Woke up while waiting for an async return, but not ready. */
-            event_del(&c->event);
-            conn_set_state(c, conn_io_pending);
-            stop = true;
-            break;
-        case conn_io_pending:
-            /* Should not be reachable */
-            assert(false);
-            break;
-        case conn_io_resume:
-            /* Complete our queued IO's from within the worker thread. */
-            conn_set_state(c, conn_mwrite);
-            break;
         case conn_max_state:
             assert(false);
             break;
@@ -3352,455 +3091,6 @@ static void drive_machine(conn *c) {
     }
 
     return;
-}
-
-void event_handler(const evutil_socket_t fd, const short which, void *arg) {
-    conn *c;
-
-    c = (conn *)arg;
-    assert(c != NULL);
-
-    c->which = which;
-
-    /* sanity */
-    if (fd != c->sfd) {
-        if (settings.verbose > 0)
-            fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
-        conn_close(c);
-        return;
-    }
-
-    drive_machine(c);
-
-    /* wait for next event */
-    return;
-}
-
-static int new_socket(struct addrinfo *ai) {
-    int sfd;
-    int flags;
-
-    if ((sfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1) {
-        return -1;
-    }
-
-    if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||
-        fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        perror("setting O_NONBLOCK");
-        close(sfd);
-        return -1;
-    }
-    return sfd;
-}
-
-
-/*
- * Sets a socket's send buffer size to the maximum allowed by the system.
- */
-static void maximize_sndbuf(const int sfd) {
-    socklen_t intsize = sizeof(int);
-    int last_good = 0;
-    int min, max, avg;
-    int old_size;
-
-    /* Start with the default size. */
-#ifdef _WIN32
-    if (getsockopt((SOCKET)sfd, SOL_SOCKET, SO_SNDBUF, (char *)&old_size, &intsize) != 0) {
-#else
-    if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &old_size, &intsize) != 0) {
-#endif /* #ifdef _WIN32 */
-        if (settings.verbose > 0)
-            perror("getsockopt(SO_SNDBUF)");
-        return;
-    }
-
-    /* Binary-search for the real maximum. */
-    min = old_size;
-    max = MAX_SENDBUF_SIZE;
-
-    while (min <= max) {
-        avg = ((unsigned int)(min + max)) / 2;
-        if (setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, (void *)&avg, intsize) == 0) {
-            last_good = avg;
-            min = avg + 1;
-        } else {
-            max = avg - 1;
-        }
-    }
-
-    if (settings.verbose > 1)
-        fprintf(stderr, "<%d send buffer was %d, now %d\n", sfd, old_size, last_good);
-}
-
-/**
- * Create a socket and bind it to a specific port number
- * @param interface the interface to bind to
- * @param port the port number to bind to
- * @param transport the transport protocol (TCP / UDP)
- * @param portnumber_file A filepointer to write the port numbers to
- *        when they are successfully added to the list of ports we
- *        listen on.
- */
-static int server_socket(const char *interface,
-                         int port,
-                         enum network_transport transport,
-                         FILE *portnumber_file, uint8_t ssl_enabled,
-                         uint64_t conntag,
-                         enum protocol bproto) {
-    int sfd;
-    struct linger ling = {0, 0};
-    struct addrinfo *ai;
-    struct addrinfo *next;
-    struct addrinfo hints = { .ai_flags = AI_PASSIVE,
-                              .ai_family = AF_UNSPEC };
-    char port_buf[NI_MAXSERV];
-    int error;
-    int success = 0;
-    int flags =1;
-
-    hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
-
-    if (port == -1) {
-        port = 0;
-    }
-    snprintf(port_buf, sizeof(port_buf), "%d", port);
-    error= getaddrinfo(interface, port_buf, &hints, &ai);
-    if (error != 0) {
-        if (error != EAI_SYSTEM)
-          fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
-        else
-          perror("getaddrinfo()");
-        return 1;
-    }
-
-    for (next= ai; next; next= next->ai_next) {
-        conn *listen_conn_add;
-        if ((sfd = new_socket(next)) == -1) {
-            /* getaddrinfo can return "junk" addresses,
-             * we make sure at least one works before erroring.
-             */
-            if (errno == EMFILE) {
-                /* ...unless we're out of fds */
-                perror("server_socket");
-                exit(EX_OSERR);
-            }
-            continue;
-        }
-
-        if (settings.num_napi_ids) {
-            socklen_t len = sizeof(socklen_t);
-            int napi_id;
-            error = getsockopt(sfd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napi_id, &len);
-            if (error != 0) {
-                fprintf(stderr, "-N <num_napi_ids> option not supported\n");
-                exit(EXIT_FAILURE);
-            }
-        }
-
-#ifdef IPV6_V6ONLY
-        if (next->ai_family == AF_INET6) {
-            error = setsockopt(sfd, IPPROTO_IPV6, IPV6_V6ONLY, (char *) &flags, sizeof(flags));
-            if (error != 0) {
-                perror("setsockopt");
-                close(sfd);
-                continue;
-            }
-        }
-#endif
-#ifdef SOCK_COOKIE_ID
-        if (settings.sock_cookie_id != 0) {
-            error = setsockopt(sfd, SOL_SOCKET, SOCK_COOKIE_ID, (void *)&settings.sock_cookie_id, sizeof(uint32_t));
-            if (error != 0)
-                perror("setsockopt");
-        }
-#endif
-
-        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
-        if (IS_UDP(transport)) {
-            maximize_sndbuf(sfd);
-        } else {
-            error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
-            if (error != 0)
-                perror("setsockopt");
-
-            error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
-            if (error != 0)
-                perror("setsockopt");
-
-            error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
-            if (error != 0)
-                perror("setsockopt");
-        }
-
-        if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
-            if (errno != EADDRINUSE) {
-                perror("bind()");
-                close(sfd);
-                freeaddrinfo(ai);
-                return 1;
-            }
-            close(sfd);
-            continue;
-        } else {
-            success++;
-            if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
-                perror("listen()");
-                close(sfd);
-                freeaddrinfo(ai);
-                return 1;
-            }
-            if (portnumber_file != NULL &&
-                (next->ai_addr->sa_family == AF_INET ||
-                 next->ai_addr->sa_family == AF_INET6)) {
-                union {
-                    struct sockaddr_in in;
-                    struct sockaddr_in6 in6;
-                } my_sockaddr;
-                socklen_t len = sizeof(my_sockaddr);
-                if (getsockname(sfd, (struct sockaddr*)&my_sockaddr, &len)==0) {
-                    if (next->ai_addr->sa_family == AF_INET) {
-                        fprintf(portnumber_file, "%s INET: %u\n",
-                                IS_UDP(transport) ? "UDP" : "TCP",
-                                ntohs(my_sockaddr.in.sin_port));
-                    } else {
-                        fprintf(portnumber_file, "%s INET6: %u\n",
-                                IS_UDP(transport) ? "UDP" : "TCP",
-                                ntohs(my_sockaddr.in6.sin6_port));
-                    }
-                }
-            }
-        }
-
-        if (IS_UDP(transport)) {
-            int c;
-
-            for (c = 0; c < settings.num_threads_per_udp; c++) {
-                /* Allocate one UDP file descriptor per worker thread;
-                 * this allows "stats conns" to separately list multiple
-                 * parallel UDP requests in progress.
-                 *
-                 * The dispatch code round-robins new connection requests
-                 * among threads, so this is guaranteed to assign one
-                 * FD to each thread.
-                 */
-                int per_thread_fd;
-                if (c == 0) {
-                    per_thread_fd = sfd;
-                } else {
-                    per_thread_fd = dup(sfd);
-                    if (per_thread_fd < 0) {
-                        perror("Failed to duplicate file descriptor");
-                        exit(EXIT_FAILURE);
-                    }
-                }
-                dispatch_conn_new(per_thread_fd, conn_read,
-                                  EV_READ | EV_PERSIST,
-                                  UDP_READ_BUFFER_SIZE, transport, NULL, conntag, bproto);
-            }
-        } else {
-            if (!(listen_conn_add = conn_new(sfd, conn_listening,
-                                             EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL, conntag, bproto))) {
-                fprintf(stderr, "failed to create listening connection\n");
-                exit(EXIT_FAILURE);
-            }
-#ifdef TLS
-            listen_conn_add->ssl_enabled = ssl_enabled;
-#else
-            assert(ssl_enabled == false);
-#endif
-            listen_conn_add->next = listen_conn;
-            listen_conn = listen_conn_add;
-        }
-    }
-
-    freeaddrinfo(ai);
-
-    /* Return zero iff we detected no errors in starting up connections */
-    return success == 0;
-}
-
-static int server_sockets(int port, enum network_transport transport,
-                          FILE *portnumber_file) {
-    uint8_t ssl_enabled = MC_SSL_DISABLED;
-
-    const char *notls = "notls";
-    const char *btls = "btls";
-    const char *mtls = "mtls";
-    if (settings.ssl_enabled) {
-        ssl_enabled = MC_SSL_ENABLED_DEFAULT;
-    }
-
-    if (settings.inter == NULL) {
-        return server_socket(settings.inter, port, transport, portnumber_file, ssl_enabled, 0, settings.binding_protocol);
-    } else {
-        // tokenize them and bind to each one of them..
-        char *b;
-        int ret = 0;
-        char *list = strdup(settings.inter);
-
-        if (list == NULL) {
-            fprintf(stderr, "Failed to allocate memory for parsing server interface string\n");
-            return 1;
-        }
-        // If we encounter any failure, preserve the first errno for the caller.
-        int errno_save = 0;
-        for (char *p = strtok_r(list, ";,", &b);
-            p != NULL;
-            p = strtok_r(NULL, ";,", &b)) {
-            uint64_t conntag = 0;
-            int the_port = port;
-            if (settings.ssl_enabled) {
-                ssl_enabled = MC_SSL_ENABLED_DEFAULT;
-            }
-            // "notls" option is valid only when memcached is run with SSL enabled.
-            if (strncmp(p, notls, strlen(notls)) == 0) {
-                if (!settings.ssl_enabled) {
-                    fprintf(stderr, "'notls' option is valid only when SSL is enabled\n");
-                    free(list);
-                    return 1;
-                }
-                ssl_enabled = MC_SSL_DISABLED;
-                p += strlen(notls) + 1;
-            } else if (strncmp(p, btls, strlen(btls)) == 0) {
-                 if (!settings.ssl_enabled) {
-                    fprintf(stderr, "'btls' option is valid only when SSL is enabled\n");
-                    free(list);
-                    return 1;
-                }
-                ssl_enabled = MC_SSL_ENABLED_NOPEER;
-                p += strlen(btls) + 1;
-            } else if (strncmp(p, mtls, strlen(mtls)) == 0) {
-                if (!settings.ssl_enabled) {
-                    fprintf(stderr, "'otls' option is valid only when SSL is enabled\n");
-                    free(list);
-                    return 1;
-                }
-                ssl_enabled = MC_SSL_ENABLED_PEER;
-                p += strlen(mtls) + 1;
-            }
-
-            // Allow forcing the protocol of this listener.
-            const char *protostr = "proto";
-            enum protocol bproto = settings.binding_protocol;
-            if (strncmp(p, protostr, strlen(protostr)) == 0) {
-                p += strlen(protostr);
-                if (*p == '[') {
-                    char *e = strchr(p, ']');
-                    if (e == NULL) {
-                        fprintf(stderr, "Invalid protocol spec: \"%s\"\n", p);
-                        free(list);
-                        return 1;
-                    }
-                    char *st = ++p; // skip '[';
-                    *e = '\0';
-                    size_t len = e - st;
-                    p = ++e; // skip ']'
-                    p++; // skip an assumed ':'
-
-                    if (strncmp(st, "ascii", len) == 0) {
-                        bproto = ascii_prot;
-                    } else if (strncmp(st, "binary", len) == 0) {
-                        bproto = binary_prot;
-                    } else if (strncmp(st, "negotiating", len) == 0) {
-                        bproto = negotiating_prot;
-                    } else if (strncmp(st, "proxy", len) == 0) {
-#ifdef PROXY
-                        if (settings.proxy_enabled) {
-                            bproto = proxy_prot;
-                        } else {
-                            fprintf(stderr, "Proxy must be enabled to use: \"%s\"\n", list);
-                            free(list);
-                            return 1;
-                        }
-#else
-                        fprintf(stderr, "Server not built with proxy: \"%s\"\n", list);
-                        free(list);
-                        return 1;
-#endif
-                    }
-                }
-            }
-
-            const char *tagstr = "tag";
-            if (strncmp(p, tagstr, strlen(tagstr)) == 0) {
-                p += strlen(tagstr);
-                // NOTE: should probably retire the [] dumbassery. those're
-                // shell characters.
-                if (*p == '[' || *p == '_') {
-                    char *e = strchr(p, ']');
-                    if (e == NULL) {
-                        e = strchr(p+1, '_');
-                    }
-                    if (e == NULL) {
-                        fprintf(stderr, "Invalid tag in socket config: \"%s\"\n", p);
-                        free(list);
-                        return 1;
-                    }
-                    char *st = ++p; // skip '['
-                    *e = '\0';
-                    size_t len = e - st;
-                    p = ++e; // skip ']'
-                    p++; // skip an assumed ':'
-
-                    // validate the tag and copy it in.
-                    if (len > 8 || len < 1) {
-                        fprintf(stderr, "Listener tags must be between 1 and 8 characters: \"%s\"\n", st);
-                        free(list);
-                        return 1;
-                    }
-
-                    // C programmers love turning string comparisons into
-                    // integer comparisons.
-                    memcpy(&conntag, st, len);
-                }
-            }
-
-            char *h = NULL;
-            if (*p == '[') {
-                // expecting it to be an IPv6 address enclosed in []
-                // i.e. RFC3986 style recommended by RFC5952
-                char *e = strchr(p, ']');
-                if (e == NULL) {
-                    fprintf(stderr, "Invalid IPV6 address: \"%s\"", p);
-                    free(list);
-                    return 1;
-                }
-                h = ++p; // skip the opening '['
-                *e = '\0';
-                p = ++e; // skip the closing ']'
-            }
-
-            char *s = strchr(p, ':');
-            if (s != NULL) {
-                // If no more semicolons - attempt to treat as port number.
-                // Otherwise the only valid option is an unenclosed IPv6 without port, until
-                // of course there was an RFC3986 IPv6 address previously specified -
-                // in such a case there is no good option, will just send it to fail as port number.
-                if (strchr(s + 1, ':') == NULL || h != NULL) {
-                    *s = '\0';
-                    ++s;
-                    if (!safe_strtol(s, &the_port)) {
-                        fprintf(stderr, "Invalid port number: \"%s\"\n", s);
-                        free(list);
-                        return 1;
-                    }
-                }
-            }
-
-            if (h != NULL)
-                p = h;
-
-            if (strcmp(p, "*") == 0) {
-                p = NULL;
-            }
-            ret |= server_socket(p, the_port, transport, portnumber_file, ssl_enabled, conntag, bproto);
-            if (ret != 0 && errno_save == 0) errno_save = errno;
-        }
-        free(list);
-        errno = errno_save;
-        return ret;
-    }
 }
 
 #ifndef DISABLE_UNIX_SOCKET
@@ -3872,12 +3162,8 @@ static int server_socket_unix(const char *path, int access_mask) {
         close(sfd);
         return 1;
     }
-    if (!(listen_conn = conn_new(sfd, conn_listening,
-                                 EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL, 0, settings.binding_protocol))) {
-        fprintf(stderr, "failed to create listening connection\n");
-        exit(EXIT_FAILURE);
-    }
+    /* TODO: register sfd with upcall accept path for unix socket support. */
+    close(sfd);
 
     return 0;
 }
@@ -3894,7 +3180,7 @@ static int server_socket_unix(const char *path, int access_mask) {
  * sizeof(time_t) > sizeof(unsigned int).
  */
 volatile rel_time_t current_time;
-static struct event clockevent;
+static int clock_timerfd = -1;
 #ifdef MEMCACHED_DEBUG
 volatile bool is_paused;
 volatile int64_t delta;
@@ -3904,26 +3190,37 @@ static bool monotonic = false;
 static int64_t monotonic_start;
 #endif
 
-/* libevent uses a monotonic clock when available for event scheduling. Aside
- * from jitter, simply ticking our internal timer here is accurate enough.
- * Note that users who are setting explicit dates for expiration times *must*
- * ensure their clocks are correct before starting memcached. */
-static void clock_handler(const evutil_socket_t fd, const short which, void *arg) {
-    struct timeval t = {.tv_sec = 1, .tv_usec = 0};
-    static bool initialized = false;
-
-    if (initialized) {
-        /* only delete the event if it's actually there. */
-        evtimer_del(&clockevent);
-    } else {
-        initialized = true;
+static void update_current_time(void) {
+#ifdef MEMCACHED_DEBUG
+    if (is_paused) return;
+#endif
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    if (monotonic) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+            return;
+#ifdef MEMCACHED_DEBUG
+        current_time = (rel_time_t) (ts.tv_sec - monotonic_start + delta);
+#else
+        current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
+#endif
+        return;
     }
+#endif
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+#ifdef MEMCACHED_DEBUG
+        current_time = (rel_time_t) (tv.tv_sec - process_started + delta);
+#else
+        current_time = (rel_time_t) (tv.tv_sec - process_started);
+#endif
+    }
+}
 
-    // While we're here, check for hash table expansion.
-    // This function should be quick to avoid delaying the timer.
+static void clock_upcall_cb(struct up_event *evt) {
     assoc_start_expand(stats_state.curr_items);
-    // also, if HUP'ed we need to do some maintenance.
-    // for now that's just the authfile and TLS certificates reload.
+
     if (settings.sig_hup) {
         settings.sig_hup = false;
 
@@ -3947,36 +3244,30 @@ static void clock_handler(const evutil_socket_t fd, const short which, void *arg
 #endif
     }
 
-    evtimer_set(&clockevent, clock_handler, 0);
-    event_base_set(main_base, &clockevent);
-    evtimer_add(&clockevent, &t);
+    update_current_time();
+    add_read(evt->fd, clock_upcall_cb);
+}
 
-#ifdef MEMCACHED_DEBUG
-    if (is_paused) return;
-#endif
+static void clock_init(void) {
+    struct itimerspec ts = {
+        .it_interval = { .tv_sec = 1, .tv_nsec = 0 },
+        .it_value    = { .tv_sec = 1, .tv_nsec = 0 },
+    };
 
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    if (monotonic) {
-        struct timespec ts;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
-            return;
-#ifdef MEMCACHED_DEBUG
-        current_time = (rel_time_t) (ts.tv_sec - monotonic_start + delta);
-#else
-        current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
-#endif
-        return;
+    clock_timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (clock_timerfd == -1) {
+        perror("timerfd_create");
+        exit(EXIT_FAILURE);
     }
-#endif
-    {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-#ifdef MEMCACHED_DEBUG
-        current_time = (rel_time_t) (tv.tv_sec - process_started + delta);
-#else
-        current_time = (rel_time_t) (tv.tv_sec - process_started);
-#endif
+    if (timerfd_settime(clock_timerfd, 0, &ts, NULL) == -1) {
+        perror("timerfd_settime");
+        exit(EXIT_FAILURE);
     }
+    update_current_time();
+}
+
+void clock_start(void) {
+    add_read(clock_timerfd, clock_upcall_cb);
 }
 
 static const char* flag_enabled_disabled(bool flag) {
@@ -4361,17 +3652,17 @@ static int enable_large_pages(void) {
  * @return true if no errors found, false if we can't use this env
  */
 static bool sanitycheck(void) {
-    /* One of our biggest problems is old and bogus libevents */
-    const char *ever = event_get_version();
-    if (ever != NULL) {
-        if (strncmp(ever, "1.", 2) == 0) {
-            fprintf(stderr, "You are using libevent %s.\nPlease upgrade to 2.x"
-                        " or newer\n", event_get_version());
-            return false;
-        }
-    }
-
     return true;
+}
+
+/* Called by side threads (crawler, logger) to release a borrowed conn. */
+void sidethread_conn_close(conn *c) {
+    conn_close(c);
+}
+
+void redispatch_conn(conn *c) {
+    conn_set_state(c, conn_closing);
+    drive_machine(c);
 }
 
 static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
@@ -5884,19 +5175,6 @@ int main (int argc, char **argv) {
 #endif
     }
 
-    /* initialize main thread libevent instance */
-#if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
-    /* If libevent version is larger/equal to 2.0.2-alpha, use newer version */
-    struct event_config *ev_config;
-    ev_config = event_config_new();
-    event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
-    main_base = event_base_new_with_config(ev_config);
-    event_config_free(ev_config);
-#else
-    /* Otherwise, use older API */
-    main_base = event_init();
-#endif
-
     /* Load initial auth file if required */
     if (settings.auth_file) {
         if (settings.udpport) {
@@ -6010,6 +5288,7 @@ int main (int argc, char **argv) {
         settings.proxy_ctx = proxy_init(settings.proxy_uring, settings.proxy_memprofile);
     }
 #endif
+
 #ifdef EXTSTORE
     memcached_thread_init(settings.num_threads, storage);
     init_lru_crawler(storage);
@@ -6083,7 +5362,7 @@ int main (int argc, char **argv) {
         }
     }
 #endif
-    clock_handler(0, 0, 0);
+    clock_init();
 
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
@@ -6094,70 +5373,7 @@ int main (int argc, char **argv) {
         }
     }
 
-    /* create the listening socket, bind it, and init */
-    if (settings.socketpath == NULL) {
-        const char *portnumber_filename = getenv("MEMCACHED_PORT_FILENAME");
-        char *temp_portnumber_filename = NULL;
-        size_t len;
-        FILE *portnumber_file = NULL;
-
-        if (portnumber_filename != NULL) {
-            len = strlen(portnumber_filename)+4+1;
-            temp_portnumber_filename = malloc(len);
-            if (temp_portnumber_filename == NULL) {
-                vperror("Failed to allocate memory for portnumber file");
-                exit(EX_OSERR);
-            }
-            snprintf(temp_portnumber_filename,
-                     len,
-                     "%s.lck", portnumber_filename);
-
-            portnumber_file = fopen(temp_portnumber_filename, "a");
-            if (portnumber_file == NULL) {
-                fprintf(stderr, "Failed to open \"%s\": %s\n",
-                        temp_portnumber_filename, strerror(errno));
-            }
-        }
-
-        errno = 0;
-        if (settings.port && server_sockets(settings.port, tcp_transport,
-                                           portnumber_file)) {
-            if (settings.inter == NULL) {
-                vperror("failed to listen on TCP port %d", settings.port);
-            } else {
-                vperror("failed to listen on one of interface(s) %s", settings.inter);
-            }
-            free(temp_portnumber_filename);
-            exit(EX_OSERR);
-        }
-
-        /*
-         * initialization order: first create the listening sockets
-         * (may need root on low ports), then drop root if needed,
-         * then daemonize if needed, then init libevent (in some cases
-         * descriptors created by libevent wouldn't survive forking).
-         */
-
-        /* create the UDP listening socket and bind it */
-        errno = 0;
-        if (settings.udpport && server_sockets(settings.udpport, udp_transport,
-                                              portnumber_file)) {
-            if (settings.inter == NULL) {
-                vperror("failed to listen on UDP port %d", settings.udpport);
-            } else {
-                vperror("failed to listen on one of interface(s) %s", settings.inter);
-            }
-            free(temp_portnumber_filename);
-            exit(EX_OSERR);
-        }
-
-        if (portnumber_file) {
-            fclose(portnumber_file);
-            rename(temp_portnumber_filename, portnumber_filename);
-        }
-        if (temp_portnumber_filename)
-            free(temp_portnumber_filename);
-    }
+    /* TCP and UDP listening are handled per-worker in worker_init_listeners. */
 
     /* Give the sockets a moment to open. I know this is dumb, but the error
      * is only an advisory.
@@ -6180,13 +5396,15 @@ int main (int argc, char **argv) {
     /* Initialize the uriencode lookup table. */
     uriencode_init();
 
-    /* enter the event loop */
-    while (!stop_main_loop) {
-        if (event_base_loop(main_base, EVLOOP_ONCE) != 0) {
-            retval = EXIT_FAILURE;
-            break;
-        }
-    }
+    /* release workers into their event loops */
+    fprintf(stderr, "!! MEMCACHED READY !!\n");
+    clock_start();
+
+    upcall_workers_go();
+
+    /* main thread waits for SIGTERM/SIGINT/SIGHUP to set stop_main_loop */
+    while (stop_main_loop == NOT_STOP)
+        pause();
 
     switch (stop_main_loop) {
         case GRACE_STOP:
@@ -6219,9 +5437,6 @@ int main (int argc, char **argv) {
     /* Clean up strdup() call for bind() address */
     if (settings.inter)
       free(settings.inter);
-
-    /* cleanup base */
-    event_base_free(main_base);
 
     free(meta);
 

@@ -21,8 +21,10 @@ int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp);
 #define storage_get_item NULL
 #endif
 
+#ifdef EXTSTORE
 // callback for the IO queue subsystem.
 void storage_submit_cb(io_queue_t *q);
+#endif
 
 // Thread functions.
 int start_storage_write_thread(void *arg);

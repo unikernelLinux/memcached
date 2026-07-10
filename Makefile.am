@@ -130,6 +130,9 @@ memcached_LDADD += vendor/liburing/src/liburing.a
 memcached_debug_LDADD += vendor/liburing/src/liburing.a
 endif
 
+memcached_LDADD += ../../libupcall/libupcall.a
+memcached_debug_LDADD += ../../libupcall/libupcall.a
+
 memcached_debug_CFLAGS += -DMEMCACHED_DEBUG
 
 # build fails on Darwin with const signature replacements.

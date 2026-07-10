@@ -20,8 +20,10 @@ int proxy_load_config(void *arg);
 void proxy_worker_reload(void *arg, LIBEVENT_THREAD *thr);
 void proxy_gc_poke(LIBEVENT_THREAD *t);
 
+#ifdef EXTSTORE
 void proxy_submit_cb(io_queue_t *q);
 void proxy_complete_cb(io_queue_t *q);
+#endif
 
 /* lua */
 int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state);
