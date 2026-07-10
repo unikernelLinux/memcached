@@ -783,6 +783,19 @@ void conn_free(conn *c) {
     }
 }
 
+/* Discard all remaining recv data on a closing TCP socket, then close it.
+ * Registered as an add_read callback after shutdown(SHUT_WR) in conn_close.
+ * Does not touch the conn struct — conn_close already set state=conn_closed
+ * and bumped c->tag, so conns[fd] is logically dead. */
+static void drain_handler(struct up_event *evt) {
+    return_buffer(evt->buf, upcall_buf_sz());
+    if (evt->result <= 0) {
+        close(evt->fd);
+    } else {
+        add_read(evt->fd, drain_handler);
+    }
+}
+
 static void conn_close(conn *c) {
     assert(c != NULL);
 
@@ -824,7 +837,15 @@ static void conn_close(conn *c) {
     if (c->ssl_enabled) {
         ssl_conn_close(c->ssl);
     }
-    close(c->sfd);
+    if (!IS_UDP(c->transport)) {
+        /* Drain remaining recv data so close() finds an empty buffer and
+         * sends FIN instead of RST.  No shutdown(SHUT_WR) here: that would
+         * send a premature FIN to a client still expecting a response.
+         * drain_handler calls close(fd) once the peer closes or errors. */
+        add_read(c->sfd, drain_handler);
+    } else {
+        close(c->sfd);
+    }
     c->close_reason = 0;
     pthread_mutex_lock(&conn_lock);
     allow_new_conns = true;
