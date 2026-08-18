@@ -740,7 +740,7 @@ void memcached_thread_init(int nthreads, void *arg) {
         threads[i].thread_baseid = i;
     }
 
-    if (upcall_init(32, 4096, worker_setup, WORKER_LOOP) != 0) {
+    if (upcall_init(64, 4096, worker_setup, WORKER_LOOP) != 0) {
         fprintf(stderr, "upcall_init failed\n");
         exit(EXIT_FAILURE);
     }
