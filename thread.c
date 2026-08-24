@@ -29,6 +29,10 @@
 
 #define ITEMS_PER_ALLOC 64
 
+#ifndef UPCALL_BATCH_SZ
+#define UPCALL_BATCH_SZ 32
+#endif
+
 __thread LIBEVENT_THREAD *worker_me = NULL;
 
 
@@ -740,7 +744,7 @@ void memcached_thread_init(int nthreads, void *arg) {
         threads[i].thread_baseid = i;
     }
 
-    if (upcall_init(32, 4096, worker_setup, WORKER_LOOP) != 0) {
+    if (upcall_init(UPCALL_BATCH_SZ, 4096, worker_setup, WORKER_LOOP) != 0) {
         fprintf(stderr, "upcall_init failed\n");
         exit(EXIT_FAILURE);
     }
