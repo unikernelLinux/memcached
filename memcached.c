@@ -790,7 +790,7 @@ void conn_free(conn *c) {
 static void drain_handler(struct up_event *evt) {
     return_buffer(evt->buf, upcall_buf_sz());
     if (evt->result <= 0) {
-        close(evt->fd);
+        add_close(evt->fd);
     } else {
         add_read(evt->fd, drain_handler);
     }
@@ -841,10 +841,10 @@ static void conn_close(conn *c) {
         /* Drain remaining recv data so close() finds an empty buffer and
          * sends FIN instead of RST.  No shutdown(SHUT_WR) here: that would
          * send a premature FIN to a client still expecting a response.
-         * drain_handler calls close(fd) once the peer closes or errors. */
+         * drain_handler calls add_close(fd) once the peer closes or errors. */
         add_read(c->sfd, drain_handler);
     } else {
-        close(c->sfd);
+        add_close(c->sfd);
     }
     c->close_reason = 0;
     pthread_mutex_lock(&conn_lock);
