@@ -33,6 +33,15 @@
 #define UPCALL_BATCH_SZ 32
 #endif
 
+static size_t get_upcall_batch_size(void) {
+    const char *value = getenv("UPCALL_BATCH_SIZE");
+
+    if (value != NULL)
+        return strtoul(value, NULL, 10);
+
+    return UPCALL_BATCH_SZ;
+}
+
 __thread LIBEVENT_THREAD *worker_me = NULL;
 
 
@@ -744,9 +753,11 @@ void memcached_thread_init(int nthreads, void *arg) {
         threads[i].thread_baseid = i;
     }
 
-    if (upcall_init(UPCALL_BATCH_SZ, 4096, worker_setup, WORKER_LOOP) != 0) {
+    size_t batch_size = get_upcall_batch_size();
+
+    fprintf(stderr, "Upcall batch size: %zu\n", batch_size);
+    if (upcall_init(batch_size, 4096, worker_setup, WORKER_LOOP) != 0) {
         fprintf(stderr, "upcall_init failed\n");
         exit(EXIT_FAILURE);
     }
 }
-
