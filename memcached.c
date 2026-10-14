@@ -3045,7 +3045,9 @@ static void drive_machine(conn *c) {
                                      READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
             }
 
-            stop = true;
+	    // This is not how edge-triggered epoll is supposed to be used, you must accept() until
+	    // EAGAIN or EWOULDBLOCK is returned.
+            //stop = true;
             break;
 
         case conn_waiting:
