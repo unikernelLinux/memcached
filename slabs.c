@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 
 //#define DEBUG_SLAB_MOVER
@@ -102,10 +103,9 @@ unsigned int slabs_size(const int clsid) {
 static void * alloc_large_chunk(const size_t limit)
 {
     void *ptr = NULL;
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
+#if defined(__linux__) && defined(MAP_HUGETLB)
     size_t pagesize = 0;
     FILE *fp;
-    int ret;
 
     /* Get the size of huge pages */
     fp = fopen("/proc/meminfo", "r");
@@ -114,7 +114,7 @@ static void * alloc_large_chunk(const size_t limit)
 
         while ((fgets(buf, sizeof(buf), fp)))
             if (!strncmp(buf, "Hugepagesize:", 13)) {
-                ret = sscanf(buf + 13, "%zu\n", &pagesize);
+                sscanf(buf + 13, "%zu\n", &pagesize);
 
                 /* meminfo huge page size is in KiBs */
                 pagesize <<= 10;
@@ -130,18 +130,16 @@ static void * alloc_large_chunk(const size_t limit)
     if (settings.verbose > 1)
         fprintf(stderr, "huge page size: %zu\n", pagesize);
 
-    /* This works because glibc simply uses mmap when the alignment is
-     * above a certain limit. */
-    ret = posix_memalign(&ptr, pagesize, limit);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to get aligned memory chunk: %d\n", ret);
-        return NULL;
-    }
-
-    ret = madvise(ptr, limit, MADV_HUGEPAGE);
-    if (ret < 0) {
-        fprintf(stderr, "Failed to set transparent hugepage hint: %d\n", ret);
-        free(ptr);
+    /* Hugepagesize is the boot-time default_hugepagesz, so 2M vs 1G
+     * follows the kernel command line with no option here. MAP_HUGETLB
+     * takes pages from the reserved pool directly (no hugetlbfs mount)
+     * and needs a length that is a whole number of huge pages. */
+    size_t maplen = (limit + pagesize - 1) & ~(pagesize - 1);
+    ptr = mmap(NULL, maplen, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "Failed to mmap %zu bytes of hugetlb memory: %s\n",
+                maplen, strerror(errno));
         ptr = NULL;
     }
 #elif defined(__FreeBSD__)
@@ -218,8 +216,11 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             mem_current = mem_base;
             mem_avail = mem_limit;
         } else {
-            fprintf(stderr, "Warning: Failed to allocate requested memory in"
-                    " one large chunk.\nWill allocate in smaller chunks\n");
+            /* No silent fallback to small pages: that would measure 4K
+             * pages while reporting huge ones. */
+            fprintf(stderr, "Failed to allocate the slab arena as one hugetlb"
+                    " chunk; refusing to fall back to small pages.\n");
+            exit(EXIT_FAILURE);
         }
     } else if (prealloc && mem_base_external != NULL) {
         // Can't (yet) mix hugepages with mmap allocations, so separate the

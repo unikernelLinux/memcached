@@ -3653,38 +3653,24 @@ static int enable_large_pages(void) {
     }
 
     return ret;
-#elif defined(__linux__) && defined(MADV_HUGEPAGE)
-    /* check if transparent hugepages is compiled into the kernel */
-    /* RH based systems possibly uses a different path */
-    static const char *mm_thp_paths[] = {
-        "/sys/kernel/mm/transparent_hugepage/enabled",
-        "/sys/kernel/mm/redhat_transparent_hugepage/enabled",
-        NULL
-    };
-
-    char thpb[128] = {0};
-    int pfd = -1;
-    for (const char **p = mm_thp_paths; *p; p++) {
-        if ((pfd = open(*p, O_RDONLY)) != -1)
-            break;
-    }
-
-    if (pfd == -1) {
-        fprintf(stderr, "Transparent huge pages support not detected.\n");
-        fprintf(stderr, "Will use default page size.\n");
+#elif defined(__linux__) && defined(MAP_HUGETLB)
+    /* The slab arena is mmap'd MAP_HUGETLB (alloc_large_chunk), which
+     * takes pages from the hugetlb pool reserved at boot. THP state is
+     * irrelevant; what matters is that the pool is not empty. */
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (fp == NULL) {
+        fprintf(stderr, "Could not open /proc/meminfo to check the hugetlb pool.\n");
         return -1;
     }
-    ssize_t rd = read(pfd, thpb, sizeof(thpb));
-    close(pfd);
-    if (rd <= 0) {
-        fprintf(stderr, "Transparent huge pages could not read the configuration.\n");
-        fprintf(stderr, "Will use default page size.\n");
-        return -1;
-    }
-    thpb[rd] = 0;
-    if (strstr(thpb, "[never]")) {
-        fprintf(stderr, "Transparent huge pages support disabled.\n");
-        fprintf(stderr, "Will use default page size.\n");
+    char buf[64];
+    long total = 0;
+    while (fgets(buf, sizeof(buf), fp))
+        if (!strncmp(buf, "HugePages_Total:", 16))
+            total = strtol(buf + 16, NULL, 10);
+    fclose(fp);
+    if (total <= 0) {
+        fprintf(stderr, "No hugetlb pages reserved (HugePages_Total is 0).\n");
+        fprintf(stderr, "Reserve them with hugepagesz=/hugepages= on the kernel command line.\n");
         return -1;
     }
     return 0;
