@@ -104,23 +104,7 @@ static void * alloc_large_chunk(const size_t limit)
 {
     void *ptr = NULL;
 #if defined(__linux__) && defined(MAP_HUGETLB)
-    size_t pagesize = 0;
-    FILE *fp;
-
-    /* Get the size of huge pages */
-    fp = fopen("/proc/meminfo", "r");
-    if (fp != NULL) {
-        char buf[64];
-
-        while ((fgets(buf, sizeof(buf), fp)))
-            if (!strncmp(buf, "Hugepagesize:", 13)) {
-                sscanf(buf + 13, "%zu\n", &pagesize);
-
-                /* meminfo huge page size is in KiBs */
-                pagesize <<= 10;
-            }
-        fclose(fp);
-    }
+    size_t pagesize = hugepage_size();
 
     if (!pagesize) {
         fprintf(stderr, "Failed to get supported huge page size\n");

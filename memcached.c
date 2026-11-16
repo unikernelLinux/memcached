@@ -3615,6 +3615,24 @@ static void sig_usrhandler(const int sig) {
     stop_main_loop = GRACE_STOP;
 }
 
+size_t hugepage_size(void) {
+    static size_t pagesize = 0;
+    if (pagesize == 0) {
+        FILE *fp = fopen("/proc/meminfo", "r");
+        if (fp != NULL) {
+            char buf[64];
+            while (fgets(buf, sizeof(buf), fp))
+                if (!strncmp(buf, "Hugepagesize:", 13)) {
+                    sscanf(buf + 13, "%zu", &pagesize);
+                    /* meminfo huge page size is in KiBs */
+                    pagesize <<= 10;
+                }
+            fclose(fp);
+        }
+    }
+    return pagesize;
+}
+
 /*
  * On systems that supports multiple page sizes we may reduce the
  * number of TLB-misses by using the biggest available page size
@@ -4035,6 +4053,8 @@ int main (int argc, char **argv) {
     bool lock_memory = false;
     bool do_daemonize = false;
     bool preallocate = false;
+    /* -L only; preallocate is also set by the restart path. */
+    bool large_pages = false;
     int maxcore = 0;
     char *username = NULL;
     char *pid_file = NULL;
@@ -4459,6 +4479,7 @@ int main (int argc, char **argv) {
         case 'L' :
             if (enable_large_pages() == 0) {
                 preallocate = true;
+                large_pages = true;
             } else {
                 fprintf(stderr, "Cannot enable large pages on this system\n"
                     "(There is no support as of this version)\n");
@@ -5281,7 +5302,7 @@ int main (int argc, char **argv) {
     // We override the hash table start argument with what was live
     // previously, to avoid filling a huge set of items into a tiny hash
     // table.
-    assoc_init(settings.hashpower_init);
+    assoc_init(settings.hashpower_init, large_pages);
 #ifdef EXTSTORE
     if (storage_enabled && reuse_mem) {
         fprintf(stderr, "[restart] memory restart with extstore not presently supported.\n");

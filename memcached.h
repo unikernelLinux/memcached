@@ -931,6 +931,8 @@ void item_trylock_unlock(void *arg);
 void item_unlock(uint32_t hv);
 void pause_threads(enum pause_thread_types type);
 void stop_threads(void);
+/* Hugepagesize from /proc/meminfo in bytes; 0 if unknown. */
+size_t hugepage_size(void);
 int stop_conn_timeout_thread(void);
 #define refcount_incr(it) ++(it->refcount)
 #define refcount_decr(it) --(it->refcount)

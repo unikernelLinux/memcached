@@ -1,6 +1,12 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- * Hash table
+ * Hash table: one 64-byte bucket per index. A bucket holds BUCKET_SLOTS
+ * tagged item pointers and one overflow chain head. A lookup touches the
+ * bucket line, compares the 16-bit tags in registers, and dereferences
+ * only items whose tag matches, so the common hit costs one bucket miss
+ * plus one item miss. Items that do not fit in a slot are chained from
+ * the overflow pointer through it->h_next, as the old table did for all
+ * items.
  *
  * The hash function used here is by Bob Jenkins, 1996:
  *    <http://burtleburtle.net/bob/hash/doobs.html>
@@ -15,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -34,14 +41,37 @@ unsigned int hashpower = HASHPOWER_DEFAULT;
 #define hashsize(n) ((uint64_t)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
+#define BUCKET_SLOTS 7
+
+/* A slot is a user-space pointer (47 significant bits) in the low 48 bits
+ * and the tag in the high 16. Zero means empty, since no item is at 0. */
+#define SLOT_PTR_MASK (((uint64_t)1 << 48) - 1)
+#define slot_item(s) ((item *)(uintptr_t)((s) & SLOT_PTR_MASK))
+#define slot_tag(s) ((uint16_t)((s) >> 48))
+#define make_slot(it, tag) (((uint64_t)(uintptr_t)(it)) | ((uint64_t)(tag) << 48))
+
+/* The bucket index is the low hashpower bits of the 32-bit hv, so the tag
+ * is taken from the top. Above hashpower 16 the two overlap and the tag
+ * loses one bit of discrimination per extra power. */
+#define hv_tag(hv) ((uint16_t)((hv) >> 16))
+
+typedef struct {
+    uint64_t slot[BUCKET_SLOTS];
+    /* Chain head for items past the slots. The high 16 bits of this
+     * pointer are free for a per-bucket version counter later. */
+    item *overflow;
+} __attribute__((aligned(64))) bucket;
+
+_Static_assert(sizeof(bucket) == 64, "bucket must be one cache line");
+
 /* Main hash table. This is where we look except during expansion. */
-static item** primary_hashtable = 0;
+static bucket *primary_hashtable = 0;
 
 /*
  * Previous hash table. During expansion, we look here for keys that haven't
  * been moved over to the primary yet.
  */
-static item** old_hashtable = 0;
+static bucket *old_hashtable = 0;
 
 /* Flag: Are we in the middle of expanding now? */
 static bool expanding = false;
@@ -52,77 +82,124 @@ static bool expanding = false;
  */
 static uint64_t expand_bucket = 0;
 
-void assoc_init(const int hashtable_init) {
+/* Set by -L: the table comes from the same hugetlb pool as the slab arena. */
+static bool table_hugetlb = false;
+
+static size_t table_len(uint64_t nbuckets) {
+    size_t len = nbuckets * sizeof(bucket);
+#ifdef MAP_HUGETLB
+    if (table_hugetlb) {
+        size_t ps = hugepage_size();
+        len = (len + ps - 1) & ~(ps - 1);
+    }
+#endif
+    return len;
+}
+
+/* mmap gives zeroed, page-aligned memory; calloc does not promise the
+ * 64-byte alignment the bucket layout needs. */
+static bucket *table_alloc(uint64_t nbuckets) {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_HUGETLB
+    if (table_hugetlb) {
+        if (hugepage_size() == 0) {
+            fprintf(stderr, "Failed to get the huge page size for the hash table\n");
+            return NULL;
+        }
+        flags |= MAP_HUGETLB;
+    }
+#endif
+    void *p = mmap(NULL, table_len(nbuckets), PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "Failed to mmap %zu bytes for the hash table: %s\n",
+                table_len(nbuckets), strerror(errno));
+        return NULL;
+    }
+    return p;
+}
+
+static void table_free(bucket *t, uint64_t nbuckets) {
+    munmap(t, table_len(nbuckets));
+}
+
+void assoc_init(const int hashtable_init, const bool large_pages) {
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
-    primary_hashtable = calloc(hashsize(hashpower), sizeof(void *));
+    table_hugetlb = large_pages;
+    primary_hashtable = table_alloc(hashsize(hashpower));
     if (! primary_hashtable) {
         fprintf(stderr, "Failed to init hashtable.\n");
         exit(EXIT_FAILURE);
     }
     STATS_LOCK();
     stats_state.hash_power_level = hashpower;
-    stats_state.hash_bytes = hashsize(hashpower) * sizeof(void *);
+    stats_state.hash_bytes = hashsize(hashpower) * sizeof(bucket);
     STATS_UNLOCK();
 }
 
-item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
-    item *it;
+static inline bucket *bucket_for(const uint32_t hv) {
     uint64_t oldbucket;
 
     if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
     {
-        it = old_hashtable[oldbucket];
-    } else {
-        it = primary_hashtable[hv & hashmask(hashpower)];
+        return &old_hashtable[oldbucket];
     }
+    return &primary_hashtable[hv & hashmask(hashpower)];
+}
 
-    item *ret = NULL;
+static inline bool key_eq(const item *it, const char *key, const size_t nkey) {
+    return nkey == it->nkey && memcmp(key, ITEM_key(it), nkey) == 0;
+}
+
+item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
+    bucket *b = bucket_for(hv);
+    const uint16_t tag = hv_tag(hv);
+    item *it;
 #ifdef ENABLE_DTRACE
     int depth = 0;
 #endif
-    while (it) {
-        if ((nkey == it->nkey) && (memcmp(key, ITEM_key(it), nkey) == 0)) {
-            ret = it;
-            break;
+
+    for (int i = 0; i < BUCKET_SLOTS; i++) {
+        uint64_t s = b->slot[i];
+        if (s != 0 && slot_tag(s) == tag) {
+            it = slot_item(s);
+            if (key_eq(it, key, nkey)) {
+                MEMCACHED_ASSOC_FIND(key, nkey, 0);
+                return it;
+            }
         }
-        it = it->h_next;
+    }
+    for (it = b->overflow; it != NULL; it = it->h_next) {
 #ifdef ENABLE_DTRACE
         ++depth;
 #endif
+        if (key_eq(it, key, nkey)) {
+            MEMCACHED_ASSOC_FIND(key, nkey, depth);
+            return it;
+        }
     }
     MEMCACHED_ASSOC_FIND(key, nkey, depth);
-    return ret;
+    return NULL;
 }
 
-/* returns the address of the item pointer before the key.  if *item == 0,
-   the item wasn't found */
-
-static item** _hashitem_before (const char *key, const size_t nkey, const uint32_t hv) {
-    item **pos;
-    uint64_t oldbucket;
-
-    if (expanding &&
-        (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
-    {
-        pos = &old_hashtable[oldbucket];
-    } else {
-        pos = &primary_hashtable[hv & hashmask(hashpower)];
+static void bucket_insert(bucket *b, item *it, const uint32_t hv) {
+    for (int i = 0; i < BUCKET_SLOTS; i++) {
+        if (b->slot[i] == 0) {
+            b->slot[i] = make_slot(it, hv_tag(hv));
+            return;
+        }
     }
-
-    while (*pos && ((nkey != (*pos)->nkey) || memcmp(key, ITEM_key(*pos), nkey))) {
-        pos = &(*pos)->h_next;
-    }
-    return pos;
+    it->h_next = b->overflow;
+    b->overflow = it;
 }
 
 /* grows the hashtable to the next power of 2. */
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
 
-    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    primary_hashtable = table_alloc(hashsize(hashpower + 1));
     if (primary_hashtable) {
         if (settings.verbose > 1)
             fprintf(stderr, "Hash table expansion starting\n");
@@ -131,7 +208,7 @@ static void assoc_expand(void) {
         expand_bucket = 0;
         STATS_LOCK();
         stats_state.hash_power_level = hashpower;
-        stats_state.hash_bytes += hashsize(hashpower) * sizeof(void *);
+        stats_state.hash_bytes += hashsize(hashpower) * sizeof(bucket);
         stats_state.hash_is_expanding = true;
         STATS_UNLOCK();
     } else {
@@ -151,27 +228,39 @@ void assoc_start_expand(uint64_t curr_items) {
 
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
 int assoc_insert(item *it, const uint32_t hv) {
-    uint64_t oldbucket;
-
 //    assert(assoc_find(ITEM_key(it), it->nkey) == 0);  /* shouldn't have duplicately named things defined */
 
-    if (expanding &&
-        (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
-    {
-        it->h_next = old_hashtable[oldbucket];
-        old_hashtable[oldbucket] = it;
-    } else {
-        it->h_next = primary_hashtable[hv & hashmask(hashpower)];
-        primary_hashtable[hv & hashmask(hashpower)] = it;
-    }
+    bucket_insert(bucket_for(hv), it, hv);
 
     MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey);
     return 1;
 }
 
 void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
-    item **before = _hashitem_before(key, nkey, hv);
+    bucket *b = bucket_for(hv);
+    const uint16_t tag = hv_tag(hv);
 
+    for (int i = 0; i < BUCKET_SLOTS; i++) {
+        uint64_t s = b->slot[i];
+        if (s != 0 && slot_tag(s) == tag && key_eq(slot_item(s), key, nkey)) {
+            MEMCACHED_ASSOC_DELETE(key, nkey);
+            b->slot[i] = 0;
+            /* Refill the slot from the chain so chains only exist while
+             * the bucket is full. The chain head's tag is recomputed. */
+            item *o = b->overflow;
+            if (o != NULL) {
+                b->overflow = o->h_next;
+                o->h_next = 0;
+                b->slot[i] = make_slot(o, hv_tag(hash(ITEM_key(o), o->nkey)));
+            }
+            return;
+        }
+    }
+
+    item **before = &b->overflow;
+    while (*before && !key_eq(*before, key, nkey)) {
+        before = &(*before)->h_next;
+    }
     if (*before) {
         item *nxt;
         /* The DTrace probe cannot be triggered as the last instruction
@@ -194,6 +283,12 @@ static volatile int do_run_maintenance_thread = 1;
 #define DEFAULT_HASH_BULK_MOVE 1
 int hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
 
+static void move_to_primary(item *it) {
+    uint32_t hv = hash(ITEM_key(it), it->nkey);
+    it->h_next = 0;
+    bucket_insert(&primary_hashtable[hv & hashmask(hashpower)], it, hv);
+}
+
 static void *assoc_maintenance_thread(void *arg) {
 
     mutex_lock(&maintenance_lock);
@@ -203,7 +298,6 @@ static void *assoc_maintenance_thread(void *arg) {
         /* There is only one expansion thread, so no need to global lock. */
         for (ii = 0; ii < hash_bulk_move && expanding; ++ii) {
             item *it, *next;
-            uint64_t bucket;
             void *item_lock = NULL;
 
             /* bucket = hv & hashmask(hashpower) =>the bucket of hash table
@@ -211,21 +305,24 @@ static void *assoc_maintenance_thread(void *arg) {
              *  also the lowest M bits of hv, and N is greater than M.
              *  So we can process expanding with only one item_lock. cool! */
             if ((item_lock = item_trylock(expand_bucket))) {
-                    for (it = old_hashtable[expand_bucket]; NULL != it; it = next) {
-                        next = it->h_next;
-                        bucket = hash(ITEM_key(it), it->nkey) & hashmask(hashpower);
-                        it->h_next = primary_hashtable[bucket];
-                        primary_hashtable[bucket] = it;
+                    bucket *b = &old_hashtable[expand_bucket];
+                    for (int i = 0; i < BUCKET_SLOTS; i++) {
+                        if (b->slot[i] != 0) {
+                            move_to_primary(slot_item(b->slot[i]));
+                        }
                     }
-
-                    old_hashtable[expand_bucket] = NULL;
+                    for (it = b->overflow; NULL != it; it = next) {
+                        next = it->h_next;
+                        move_to_primary(it);
+                    }
+                    memset(b, 0, sizeof(*b));
 
                     expand_bucket++;
                     if (expand_bucket == hashsize(hashpower - 1)) {
                         expanding = false;
-                        free(old_hashtable);
+                        table_free(old_hashtable, hashsize(hashpower - 1));
                         STATS_LOCK();
-                        stats_state.hash_bytes -= hashsize(hashpower - 1) * sizeof(void *);
+                        stats_state.hash_bytes -= hashsize(hashpower - 1) * sizeof(bucket);
                         stats_state.hash_is_expanding = false;
                         STATS_UNLOCK();
                         if (settings.verbose > 1)
@@ -296,8 +393,8 @@ void stop_assoc_maintenance_thread(void) {
 
 struct assoc_iterator {
     uint64_t bucket;
-    item *it;
-    item *next;
+    int slot;       /* next slot to visit; BUCKET_SLOTS means the chain */
+    item *next;     /* next chain item once the slots are done */
     bool bucket_locked;
 };
 
@@ -315,47 +412,44 @@ void *assoc_get_iterator(void) {
     }
 }
 
+/* Visits the slots, then the chain, of each bucket under its item lock.
+ * Returns true with *it == NULL when it steps to the next bucket. A
+ * delete during the walk may refill a slot already passed; that item is
+ * then skipped. */
 bool assoc_iterate(void *iterp, item **it) {
     struct assoc_iterator *iter = (struct assoc_iterator *) iterp;
     *it = NULL;
-    // - if locked bucket and next, update next and return
-    if (iter->bucket_locked) {
-        if (iter->next != NULL) {
-            iter->it = iter->next;
-            iter->next = iter->it->h_next;
-            *it = iter->it;
-        } else {
-            // unlock previous bucket, if any
-            item_unlock(iter->bucket);
-            // iterate the bucket post since it starts at 0.
-            iter->bucket++;
-            iter->bucket_locked = false;
-            *it = NULL;
+
+    if (!iter->bucket_locked) {
+        if (iter->bucket == hashsize(hashpower)) {
+            return false;
         }
+        // - only check the primary hash table since expand is blocked.
+        item_lock(iter->bucket);
+        iter->bucket_locked = true;
+        iter->slot = 0;
+    }
+
+    bucket *b = &primary_hashtable[iter->bucket];
+    while (iter->slot < BUCKET_SLOTS) {
+        uint64_t s = b->slot[iter->slot++];
+        if (s != 0) {
+            *it = slot_item(s);
+            return true;
+        }
+        if (iter->slot == BUCKET_SLOTS) {
+            iter->next = b->overflow;
+        }
+    }
+    if (iter->next != NULL) {
+        *it = iter->next;
+        iter->next = iter->next->h_next;
         return true;
     }
 
-    // - loop until we hit the end or find something.
-    if (iter->bucket != hashsize(hashpower)) {
-        // - lock next bucket
-        item_lock(iter->bucket);
-        iter->bucket_locked = true;
-        // - only check the primary hash table since expand is blocked.
-        iter->it = primary_hashtable[iter->bucket];
-        if (iter->it != NULL) {
-            // - set it, next and return
-            iter->next = iter->it->h_next;
-            *it = iter->it;
-        } else {
-            // - nothing found in this bucket, try next.
-            item_unlock(iter->bucket);
-            iter->bucket_locked = false;
-            iter->bucket++;
-        }
-    } else {
-        return false;
-    }
-
+    item_unlock(iter->bucket);
+    iter->bucket_locked = false;
+    iter->bucket++;
     return true;
 }
 
