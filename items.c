@@ -169,10 +169,6 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
      * This also gives one fewer code path for slab alloc/free
      */
     for (i = 0; i < 10; i++) {
-        /* Try to reclaim memory first */
-        if (!settings.lru_segmented) {
-            lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
-        }
         it = slabs_alloc(id, 0);
 
         if (it == NULL) {
@@ -545,7 +541,14 @@ void do_item_remove(item *it) {
     }
 }
 
-/* Bump the last accessed time, or relink if we're in compat mode */
+/* CLOCK reference bit. Test before set: a GET of an item that is already
+ * referenced does not write the flags. Item lock held. */
+static inline void item_mark_ref(item *it) {
+    if ((it->it_flags & ITEM_ACTIVE) == 0)
+        it->it_flags |= ITEM_FETCHED | ITEM_ACTIVE;
+}
+
+/* Bump the last accessed time, or set the reference bit in CLOCK mode */
 void do_item_update(item *it) {
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
 
@@ -564,14 +567,11 @@ void do_item_update(item *it) {
                 it->time = current_time;
             }
         }
-    } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+    } else {
         assert((it->it_flags & ITEM_SLABBED) == 0);
 
-        if ((it->it_flags & ITEM_LINKED) != 0) {
-            it->time = current_time;
-            item_unlink_q(it);
-            item_link_q(it);
-        }
+        if ((it->it_flags & ITEM_LINKED) != 0)
+            item_mark_ref(it);
     }
 }
 
@@ -1051,8 +1051,7 @@ void do_item_bump(LIBEVENT_THREAD *t, item *it, const uint32_t hv) {
             }
         }
     } else {
-        it->it_flags |= ITEM_FETCHED;
-        do_item_update(it);
+        item_mark_ref(it);
     }
 }
 
@@ -1084,10 +1083,14 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
     void *hold_lock = NULL;
     unsigned int move_to_lru = 0;
     uint64_t limit = 0;
+    unsigned int sweep;
 
     id |= cur_lru;
     pthread_mutex_lock(&lru_locks[id]);
     search = tails[id];
+    /* One full turn of the CLOCK hand clears all reference bits. After
+     * that, evict without a second chance so that the sweep has an end. */
+    sweep = sizes[id];
     /* We walk up *only* for locked items, and if bottom is expired. */
     for (; tries > 0 && search != NULL; tries--, search=next_it) {
         /* we might relink search mid-loop, so search->prev isn't reliable */
@@ -1184,6 +1187,20 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                 }
                 break;
             case COLD_LRU:
+                if (!settings.lru_segmented && (flags & LRU_PULL_EVICT)
+                        && (search->it_flags & ITEM_ACTIVE) && sweep > 0) {
+                    /* CLOCK second chance: clear the bit and move the item
+                     * behind the hand (the tail is the hand). */
+                    search->it_flags &= ~ITEM_ACTIVE;
+                    itemstats[id].moves_within_lru++;
+                    do_item_unlink_q(search);
+                    do_item_link_q(search);
+                    do_item_remove(search);
+                    item_trylock_unlock(hold_lock);
+                    sweep--;
+                    tries++;
+                    continue;
+                }
                 it = search; /* No matter what, we're stopping */
                 if (flags & LRU_PULL_EVICT) {
                     if (settings.evict_to_free == 0) {
