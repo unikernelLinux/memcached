@@ -744,6 +744,7 @@ void memcached_thread_init(int nthreads, void *arg) {
         threads[i].thread_baseid = i;
     }
 
+    upcall_set_batch_fn(batch_handler);
     if (upcall_init(UPCALL_BATCH_SZ, 4096, worker_setup, WORKER_LOOP) != 0) {
         fprintf(stderr, "upcall_init failed\n");
         exit(EXIT_FAILURE);

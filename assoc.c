@@ -149,6 +149,10 @@ static inline bucket *bucket_for(const uint32_t hv) {
     return &primary_hashtable[hv & hashmask(hashpower)];
 }
 
+void assoc_prefetch(const uint32_t hv) {
+    __builtin_prefetch(bucket_for(hv));
+}
+
 static inline bool key_eq(const item *it, const char *key, const size_t nkey) {
     return nkey == it->nkey && memcmp(key, ITEM_key(it), nkey) == 0;
 }

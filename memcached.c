@@ -2829,6 +2829,69 @@ void read_handler(struct up_event *evt) {
     drive_machine(c);
 }
 
+/* Hash the first GET key in a read completion and prefetch its bucket.
+ * Only the common request shapes are recognised; anything else, including
+ * a buffer that continues a request split across reads, gets no prefetch,
+ * which costs nothing. The conn is deliberately not consulted: its line is
+ * as cold as the bucket under cross-CPU delivery. */
+static void prefetch_first_key(const struct up_event *evt) {
+    const char *buf = evt->buf;
+    const size_t len = evt->result;
+    const char *key;
+    size_t nkey;
+
+    if (len < sizeof(protocol_binary_request_header)) {
+        return;
+    }
+    if ((uint8_t)buf[0] == PROTOCOL_BINARY_REQ) {
+        const protocol_binary_request_header *h = (const void *)buf;
+        switch (h->request.opcode) {
+        case PROTOCOL_BINARY_CMD_GET:
+        case PROTOCOL_BINARY_CMD_GETQ:
+        case PROTOCOL_BINARY_CMD_GETK:
+        case PROTOCOL_BINARY_CMD_GETKQ:
+            break;
+        default:
+            return;
+        }
+        key = buf + sizeof(*h) + h->request.extlen;
+        nkey = ntohs(h->request.keylen);
+    } else {
+        if (memcmp(buf, "get ", 4) == 0) {
+            key = buf + 4;
+        } else if (memcmp(buf, "gets ", 5) == 0) {
+            key = buf + 5;
+        } else {
+            return;
+        }
+        const char *end = key;
+        const char *stop = buf + len;
+        while (end < stop && *end != ' ' && *end != '\r' && *end != '\n') {
+            end++;
+        }
+        nkey = end - key;
+    }
+    if (nkey == 0 || nkey > KEY_MAX_LENGTH || key + nkey > buf + len) {
+        return;
+    }
+    assoc_prefetch(hash(key, nkey));
+}
+
+/* libupcall batch_fn: one pass to start the bucket misses for every read
+ * in the batch, then the normal per-event dispatch. */
+void batch_handler(struct up_event *evts, int n) {
+    for (int i = 0; i < n; i++) {
+        if (evts[i].work_fn == read_handler && evts[i].result > 0) {
+            prefetch_first_key(&evts[i]);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (evts[i].work_fn) {
+            evts[i].work_fn(&evts[i]);
+        }
+    }
+}
+
 void write_handler(struct up_event *evt) {
     /* Recover the write_ctx header that issue_write prepended before the data.
      * The kernel wrote only (ctx+1)[0..len-1] to the socket; the header was
