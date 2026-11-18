@@ -376,25 +376,28 @@ int stop_conn_timeout_thread(void) {
 }
 
 /*
- * read buffer cache helper functions
+ * Read buffer helpers. A TCP connection owns its read buffer from the first
+ * read until close. Events for one connection can run on any worker, so a
+ * per-thread buffer cache does not balance; the one-event-per-anchor rule
+ * makes the connection the single owner instead.
  */
 static void rbuf_release(conn *c) {
     if (c->rbuf != NULL && c->rbytes == 0 && !IS_UDP(c->transport)) {
-        if (c->rbuf_malloced) {
+        if (c->rsize != READ_BUFFER_SIZE) {
+            /* Grown for a large request: drop it, the next read starts small. */
             free(c->rbuf);
-            c->rbuf_malloced = false;
+            c->rsize = 0;
+            c->rbuf = NULL;
+            c->rcurr = NULL;
         } else {
-            cache_free(worker_me->rbuf_cache, c->rbuf);
+            c->rcurr = c->rbuf;
         }
-        c->rsize = 0;
-        c->rbuf = NULL;
-        c->rcurr = NULL;
     }
 }
 
 static bool rbuf_alloc(conn *c) {
     if (c->rbuf == NULL) {
-        c->rbuf = cache_alloc(worker_me->rbuf_cache);
+        c->rbuf = malloc(READ_BUFFER_SIZE);
         if (!c->rbuf) {
             THR_STATS_LOCK(worker_me);
             worker_me->stats.read_buf_oom++;
@@ -404,25 +407,6 @@ static bool rbuf_alloc(conn *c) {
         c->rsize = READ_BUFFER_SIZE;
         c->rcurr = c->rbuf;
     }
-    return true;
-}
-
-// Just for handling huge ASCII multigets.
-// The previous system was essentially the same; realloc'ing until big enough,
-// then realloc'ing back down after the request finished.
-bool rbuf_switch_to_malloc(conn *c) {
-    // Might as well start with x2 and work from there.
-    size_t size = c->rsize * 2;
-    char *tmp = malloc(size);
-    if (!tmp)
-        return false;
-
-    memcpy(tmp, c->rcurr, c->rbytes);
-    cache_free(worker_me->rbuf_cache, c->rbuf);
-
-    c->rcurr = c->rbuf = tmp;
-    c->rsize = size;
-    c->rbuf_malloced = true;
     return true;
 }
 
@@ -634,16 +618,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->rlbytes = 0;
     c->cmd = -1;
     c->rbytes = 0;
-    /* If a previously-grown malloc'd rbuf was left on this conn struct (from
-     * a stuck connection that was never properly closed), free it now so we
-     * don't pass a malloc'd pointer to cache_free later. */
-    if (c->rbuf_malloced && c->rbuf != NULL) {
-        free(c->rbuf);
-        c->rbuf = NULL;
-    }
     c->rcurr = c->rbuf;
     c->ritem = 0;
-    c->rbuf_malloced = false;
     c->open_bundle = NULL;
     c->item_malloced = false;
     c->sasl_started = false;
@@ -787,7 +763,36 @@ void conn_free(conn *c) {
  * Registered as an add_read callback after shutdown(SHUT_WR) in conn_close.
  * Does not touch the conn struct — conn_close already set state=conn_closed
  * and bumped c->tag, so conns[fd] is logically dead. */
+/* Arm the read again instead of giving up on the fd. -ENOMEM: the worker
+ * had no read buffer (evt->buf is NULL), so hand it a new one. -EAGAIN: a
+ * wakeup with nothing to read; the kernel passes key-less socket wakeups
+ * through its readiness mask, so this is not an error. Returns false for
+ * every other result, leaving the caller's own handling to run. */
+bool read_retry(struct up_event *evt, void (*fn)(struct up_event *)) {
+    void *buf;
+
+    switch (evt->result) {
+    case -ENOMEM:
+        buf = malloc(upcall_buf_sz());
+        if (buf == NULL) {
+            return false;
+        }
+        break;
+    case -EAGAIN:
+        buf = evt->buf;
+        break;
+    default:
+        return false;
+    }
+    return_buffer(buf, upcall_buf_sz());
+    add_read(evt->fd, fn);
+    return true;
+}
+
 static void drain_handler(struct up_event *evt) {
+    if (evt->result < 0 && read_retry(evt, drain_handler)) {
+        return;
+    }
     return_buffer(evt->buf, upcall_buf_sz());
     if (evt->result <= 0) {
         add_close(evt->fd);
@@ -810,21 +815,19 @@ static void conn_close(conn *c) {
 
     conn_cleanup(c);
 
-    // force release of read buffer.
-    if (worker_me) {
-        c->rbytes = 0;
-        rbuf_release(c);
-        /* Release any held-but-empty resp bundles. resp_free keeps the last
-         * empty bundle alive for reuse, but on close it must be freed. */
-        if (c->open_bundle) {
-            mc_resp_bundle *b = c->open_bundle;
-            while (b) {
-                mc_resp_bundle *next = b->next;
-                cache_free(worker_me->rbuf_cache, b);
-                b = next;
-            }
-            c->open_bundle = NULL;
-        }
+    /* The connection owns its buffers: release them on any thread. */
+    c->rbytes = 0;
+    if (!IS_UDP(c->transport)) {
+        free(c->rbuf);
+        c->rsize = 0;
+        c->rbuf = NULL;
+        c->rcurr = NULL;
+    }
+    /* resp_free keeps the last empty bundle for reuse; free it on close. */
+    while (c->open_bundle) {
+        mc_resp_bundle *b = c->open_bundle;
+        c->open_bundle = b->next;
+        free(b);
     }
 
     MEMCACHED_CONN_RELEASE(c->sfd);
@@ -996,7 +999,7 @@ static mc_resp* resp_allocate(conn *c) {
     }
 
     if (resp == NULL) {
-        b = cache_alloc(th->rbuf_cache);
+        b = malloc(READ_BUFFER_SIZE);
         if (b) {
             THR_STATS_LOCK(th);
             th->stats.response_obj_bytes += READ_BUFFER_SIZE;
@@ -1046,7 +1049,7 @@ void resp_free(conn *c, mc_resp *resp) {
             if (b->prev) b->prev->next = b->next;
 
             // Now completely done with this buffer.
-            cache_free(th->rbuf_cache, b);
+            free(b);
             THR_STATS_LOCK(th);
             th->stats.response_obj_bytes -= READ_BUFFER_SIZE;
             THR_STATS_UNLOCK(th);
@@ -1728,9 +1731,6 @@ void server_stats(ADD_STAT add_stats, void *c) {
     APPEND_STAT("response_obj_oom", "%llu", (unsigned long long)thread_stats.response_obj_oom);
     APPEND_STAT("response_obj_count", "%llu", (unsigned long long)thread_stats.response_obj_count);
     APPEND_STAT("response_obj_bytes", "%llu", (unsigned long long)thread_stats.response_obj_bytes);
-    APPEND_STAT("read_buf_count", "%llu", (unsigned long long)thread_stats.read_buf_count);
-    APPEND_STAT("read_buf_bytes", "%llu", (unsigned long long)thread_stats.read_buf_bytes);
-    APPEND_STAT("read_buf_bytes_free", "%llu", (unsigned long long)thread_stats.read_buf_bytes_free);
     APPEND_STAT("read_buf_oom", "%llu", (unsigned long long)thread_stats.read_buf_oom);
     APPEND_STAT("reserved_fds", "%u", stats_state.reserved_fds);
 #ifdef PROXY
@@ -2756,7 +2756,13 @@ void read_handler(struct up_event *evt) {
     int nbytes = evt->result;
 
     if (c == NULL) {
-        return_buffer(evt->buf, upcall_buf_sz());
+        if (evt->buf) {
+            return_buffer(evt->buf, upcall_buf_sz());
+        }
+        return;
+    }
+
+    if (nbytes < 0 && read_retry(evt, read_handler)) {
         return;
     }
 
@@ -2794,18 +2800,7 @@ void read_handler(struct up_event *evt) {
             while (newsize < c->rbytes + nbytes)
                 newsize *= 2;
 
-            char *newbuf;
-            if (c->rbuf_malloced) {
-                newbuf = realloc(c->rbuf, newsize);
-            } else {
-                newbuf = malloc(newsize);
-                if (newbuf && c->rbytes)
-                    memcpy(newbuf, c->rbuf, c->rbytes);
-                if (newbuf) {
-                    cache_free(worker_me->rbuf_cache, c->rbuf);
-                    c->rbuf_malloced = true;
-                }
-            }
+            char *newbuf = realloc(c->rbuf, newsize);
 
             if (!newbuf) {
                 conn_set_state(c, conn_closing);
@@ -2861,6 +2856,10 @@ void write_handler(struct up_event *evt) {
 
 void udp_read_handler(struct up_event *evt) {
     conn *c = conns[evt->fd];
+
+    if (evt->result < 0 && read_retry(evt, udp_read_handler)) {
+        return;
+    }
 
     /* add_read consumed a datagram into evt->buf without the source address.
      * Discard it; try_read_udp calls recvfrom directly to get both data and
@@ -3280,6 +3279,10 @@ static void update_current_time(void) {
 }
 
 static void clock_upcall_cb(struct up_event *evt) {
+    if (evt->result < 0 && read_retry(evt, clock_upcall_cb)) {
+        return;
+    }
+    return_buffer(evt->buf, upcall_buf_sz());
     assoc_start_expand(stats_state.curr_items);
 
     if (settings.sig_hup) {
@@ -3324,9 +3327,10 @@ static void clock_init(void) {
         perror("timerfd_settime");
         exit(EXIT_FAILURE);
     }
-    update_current_time();
 }
 
+/* Call on an upcall worker: add_read queues on the calling thread, and only
+ * a worker submits its queue. */
 void clock_start(void) {
     add_read(clock_timerfd, clock_upcall_cb);
 }
@@ -5350,6 +5354,8 @@ int main (int argc, char **argv) {
     }
 #endif
 
+    /* Worker 0 arms the clock timer in its setup, so the timer must exist. */
+    clock_init();
 #ifdef EXTSTORE
     memcached_thread_init(settings.num_threads, storage);
     init_lru_crawler(storage);
@@ -5423,7 +5429,7 @@ int main (int argc, char **argv) {
         }
     }
 #endif
-    clock_init();
+    update_current_time();
 
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
@@ -5459,7 +5465,6 @@ int main (int argc, char **argv) {
 
     /* release workers into their event loops */
     fprintf(stderr, "!! MEMCACHED READY !!\n");
-    clock_start();
 
     upcall_workers_go();
 
