@@ -376,25 +376,28 @@ int stop_conn_timeout_thread(void) {
 }
 
 /*
- * read buffer cache helper functions
+ * Read buffer helpers. A TCP connection owns its read buffer from the first
+ * read until close. Events for one connection can run on any worker, so a
+ * per-thread buffer cache does not balance; the one-event-per-anchor rule
+ * makes the connection the single owner instead.
  */
 static void rbuf_release(conn *c) {
     if (c->rbuf != NULL && c->rbytes == 0 && !IS_UDP(c->transport)) {
-        if (c->rbuf_malloced) {
+        if (c->rsize != READ_BUFFER_SIZE) {
+            /* Grown for a large request: drop it, the next read starts small. */
             free(c->rbuf);
-            c->rbuf_malloced = false;
+            c->rsize = 0;
+            c->rbuf = NULL;
+            c->rcurr = NULL;
         } else {
-            cache_free(worker_me->rbuf_cache, c->rbuf);
+            c->rcurr = c->rbuf;
         }
-        c->rsize = 0;
-        c->rbuf = NULL;
-        c->rcurr = NULL;
     }
 }
 
 static bool rbuf_alloc(conn *c) {
     if (c->rbuf == NULL) {
-        c->rbuf = cache_alloc(worker_me->rbuf_cache);
+        c->rbuf = malloc(READ_BUFFER_SIZE);
         if (!c->rbuf) {
             THR_STATS_LOCK(worker_me);
             worker_me->stats.read_buf_oom++;
@@ -404,25 +407,6 @@ static bool rbuf_alloc(conn *c) {
         c->rsize = READ_BUFFER_SIZE;
         c->rcurr = c->rbuf;
     }
-    return true;
-}
-
-// Just for handling huge ASCII multigets.
-// The previous system was essentially the same; realloc'ing until big enough,
-// then realloc'ing back down after the request finished.
-bool rbuf_switch_to_malloc(conn *c) {
-    // Might as well start with x2 and work from there.
-    size_t size = c->rsize * 2;
-    char *tmp = malloc(size);
-    if (!tmp)
-        return false;
-
-    memcpy(tmp, c->rcurr, c->rbytes);
-    cache_free(worker_me->rbuf_cache, c->rbuf);
-
-    c->rcurr = c->rbuf = tmp;
-    c->rsize = size;
-    c->rbuf_malloced = true;
     return true;
 }
 
@@ -634,16 +618,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->rlbytes = 0;
     c->cmd = -1;
     c->rbytes = 0;
-    /* If a previously-grown malloc'd rbuf was left on this conn struct (from
-     * a stuck connection that was never properly closed), free it now so we
-     * don't pass a malloc'd pointer to cache_free later. */
-    if (c->rbuf_malloced && c->rbuf != NULL) {
-        free(c->rbuf);
-        c->rbuf = NULL;
-    }
     c->rcurr = c->rbuf;
     c->ritem = 0;
-    c->rbuf_malloced = false;
     c->open_bundle = NULL;
     c->item_malloced = false;
     c->sasl_started = false;
@@ -810,21 +786,19 @@ static void conn_close(conn *c) {
 
     conn_cleanup(c);
 
-    // force release of read buffer.
-    if (worker_me) {
-        c->rbytes = 0;
-        rbuf_release(c);
-        /* Release any held-but-empty resp bundles. resp_free keeps the last
-         * empty bundle alive for reuse, but on close it must be freed. */
-        if (c->open_bundle) {
-            mc_resp_bundle *b = c->open_bundle;
-            while (b) {
-                mc_resp_bundle *next = b->next;
-                cache_free(worker_me->rbuf_cache, b);
-                b = next;
-            }
-            c->open_bundle = NULL;
-        }
+    /* The connection owns its buffers: release them on any thread. */
+    c->rbytes = 0;
+    if (!IS_UDP(c->transport)) {
+        free(c->rbuf);
+        c->rsize = 0;
+        c->rbuf = NULL;
+        c->rcurr = NULL;
+    }
+    /* resp_free keeps the last empty bundle for reuse; free it on close. */
+    while (c->open_bundle) {
+        mc_resp_bundle *b = c->open_bundle;
+        c->open_bundle = b->next;
+        free(b);
     }
 
     MEMCACHED_CONN_RELEASE(c->sfd);
@@ -996,7 +970,7 @@ static mc_resp* resp_allocate(conn *c) {
     }
 
     if (resp == NULL) {
-        b = cache_alloc(th->rbuf_cache);
+        b = malloc(READ_BUFFER_SIZE);
         if (b) {
             THR_STATS_LOCK(th);
             th->stats.response_obj_bytes += READ_BUFFER_SIZE;
@@ -1046,7 +1020,7 @@ void resp_free(conn *c, mc_resp *resp) {
             if (b->prev) b->prev->next = b->next;
 
             // Now completely done with this buffer.
-            cache_free(th->rbuf_cache, b);
+            free(b);
             THR_STATS_LOCK(th);
             th->stats.response_obj_bytes -= READ_BUFFER_SIZE;
             THR_STATS_UNLOCK(th);
@@ -1728,9 +1702,6 @@ void server_stats(ADD_STAT add_stats, void *c) {
     APPEND_STAT("response_obj_oom", "%llu", (unsigned long long)thread_stats.response_obj_oom);
     APPEND_STAT("response_obj_count", "%llu", (unsigned long long)thread_stats.response_obj_count);
     APPEND_STAT("response_obj_bytes", "%llu", (unsigned long long)thread_stats.response_obj_bytes);
-    APPEND_STAT("read_buf_count", "%llu", (unsigned long long)thread_stats.read_buf_count);
-    APPEND_STAT("read_buf_bytes", "%llu", (unsigned long long)thread_stats.read_buf_bytes);
-    APPEND_STAT("read_buf_bytes_free", "%llu", (unsigned long long)thread_stats.read_buf_bytes_free);
     APPEND_STAT("read_buf_oom", "%llu", (unsigned long long)thread_stats.read_buf_oom);
     APPEND_STAT("reserved_fds", "%u", stats_state.reserved_fds);
 #ifdef PROXY
@@ -2794,18 +2765,7 @@ void read_handler(struct up_event *evt) {
             while (newsize < c->rbytes + nbytes)
                 newsize *= 2;
 
-            char *newbuf;
-            if (c->rbuf_malloced) {
-                newbuf = realloc(c->rbuf, newsize);
-            } else {
-                newbuf = malloc(newsize);
-                if (newbuf && c->rbytes)
-                    memcpy(newbuf, c->rbuf, c->rbytes);
-                if (newbuf) {
-                    cache_free(worker_me->rbuf_cache, c->rbuf);
-                    c->rbuf_malloced = true;
-                }
-            }
+            char *newbuf = realloc(c->rbuf, newsize);
 
             if (!newbuf) {
                 conn_set_state(c, conn_closing);

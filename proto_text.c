@@ -372,15 +372,8 @@ int try_read_command_ascii(conn *c) {
                 return 1;
             }
 
-            // ASCII multigets are unbound, so our fixed size rbuf may not
-            // work for this particular workload... For backcompat we'll use a
-            // malloc/realloc/free routine just for this.
-            if (!c->rbuf_malloced) {
-                if (!rbuf_switch_to_malloc(c)) {
-                    conn_set_state(c, conn_closing);
-                    return 1;
-                }
-            }
+            // ASCII multigets are unbound: read_handler grows the read
+            // buffer when the next read does not fit.
         }
 
         return 0;

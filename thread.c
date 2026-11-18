@@ -428,20 +428,6 @@ static void worker_setup(int worker_id, int nr_workers) {
         exit(EXIT_FAILURE);
     }
 
-    me->rbuf_cache = cache_create("rbuf", READ_BUFFER_SIZE, sizeof(char *));
-    if (me->rbuf_cache == NULL) {
-        fprintf(stderr, "Failed to create read buffer cache\n");
-        exit(EXIT_FAILURE);
-    }
-    if (settings.read_buf_mem_limit) {
-        int limit = settings.read_buf_mem_limit / nr_workers;
-        if (limit < READ_BUFFER_SIZE)
-            limit = 1;
-        else
-            limit = limit / READ_BUFFER_SIZE;
-        cache_set_limit(me->rbuf_cache, limit);
-    }
-
 #ifdef TLS
     if (settings.ssl_enabled) {
         me->ssl_wbuf = (char *)malloc((size_t)settings.ssl_wbuf_size);
@@ -660,9 +646,6 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
                 threads[ii].stats.lru_hits[sid];
         }
 
-        stats->read_buf_count += threads[ii].rbuf_cache->total;
-        stats->read_buf_bytes += threads[ii].rbuf_cache->total * READ_BUFFER_SIZE;
-        stats->read_buf_bytes_free += threads[ii].rbuf_cache->freecurr * READ_BUFFER_SIZE;
         pthread_mutex_unlock(&threads[ii].stats.mutex);
     }
 }
