@@ -763,7 +763,36 @@ void conn_free(conn *c) {
  * Registered as an add_read callback after shutdown(SHUT_WR) in conn_close.
  * Does not touch the conn struct — conn_close already set state=conn_closed
  * and bumped c->tag, so conns[fd] is logically dead. */
+/* Arm the read again instead of giving up on the fd. -ENOMEM: the worker
+ * had no read buffer (evt->buf is NULL), so hand it a new one. -EAGAIN: a
+ * wakeup with nothing to read; the kernel passes key-less socket wakeups
+ * through its readiness mask, so this is not an error. Returns false for
+ * every other result, leaving the caller's own handling to run. */
+bool read_retry(struct up_event *evt, void (*fn)(struct up_event *)) {
+    void *buf;
+
+    switch (evt->result) {
+    case -ENOMEM:
+        buf = malloc(upcall_buf_sz());
+        if (buf == NULL) {
+            return false;
+        }
+        break;
+    case -EAGAIN:
+        buf = evt->buf;
+        break;
+    default:
+        return false;
+    }
+    return_buffer(buf, upcall_buf_sz());
+    add_read(evt->fd, fn);
+    return true;
+}
+
 static void drain_handler(struct up_event *evt) {
+    if (evt->result < 0 && read_retry(evt, drain_handler)) {
+        return;
+    }
     return_buffer(evt->buf, upcall_buf_sz());
     if (evt->result <= 0) {
         add_close(evt->fd);
@@ -2727,7 +2756,13 @@ void read_handler(struct up_event *evt) {
     int nbytes = evt->result;
 
     if (c == NULL) {
-        return_buffer(evt->buf, upcall_buf_sz());
+        if (evt->buf) {
+            return_buffer(evt->buf, upcall_buf_sz());
+        }
+        return;
+    }
+
+    if (nbytes < 0 && read_retry(evt, read_handler)) {
         return;
     }
 
@@ -2884,6 +2919,10 @@ void write_handler(struct up_event *evt) {
 
 void udp_read_handler(struct up_event *evt) {
     conn *c = conns[evt->fd];
+
+    if (evt->result < 0 && read_retry(evt, udp_read_handler)) {
+        return;
+    }
 
     /* add_read consumed a datagram into evt->buf without the source address.
      * Discard it; try_read_udp calls recvfrom directly to get both data and
@@ -3303,6 +3342,10 @@ static void update_current_time(void) {
 }
 
 static void clock_upcall_cb(struct up_event *evt) {
+    if (evt->result < 0 && read_retry(evt, clock_upcall_cb)) {
+        return;
+    }
+    return_buffer(evt->buf, upcall_buf_sz());
     assoc_start_expand(stats_state.curr_items);
 
     if (settings.sig_hup) {
@@ -3347,9 +3390,10 @@ static void clock_init(void) {
         perror("timerfd_settime");
         exit(EXIT_FAILURE);
     }
-    update_current_time();
 }
 
+/* Call on an upcall worker: add_read queues on the calling thread, and only
+ * a worker submits its queue. */
 void clock_start(void) {
     add_read(clock_timerfd, clock_upcall_cb);
 }
@@ -5380,6 +5424,8 @@ int main (int argc, char **argv) {
     }
 #endif
 
+    /* Worker 0 arms the clock timer in its setup, so the timer must exist. */
+    clock_init();
 #ifdef EXTSTORE
     memcached_thread_init(settings.num_threads, storage);
     init_lru_crawler(storage);
@@ -5453,7 +5499,7 @@ int main (int argc, char **argv) {
         }
     }
 #endif
-    clock_init();
+    update_current_time();
 
     /* create unix mode sockets after dropping privileges */
     if (settings.socketpath != NULL) {
@@ -5489,7 +5535,6 @@ int main (int argc, char **argv) {
 
     /* release workers into their event loops */
     fprintf(stderr, "!! MEMCACHED READY !!\n");
-    clock_start();
 
     upcall_workers_go();
 

@@ -454,6 +454,9 @@ static void worker_setup(int worker_id, int nr_workers) {
     }
 
     worker_init_listeners();
+
+    if (worker_id == 0)
+        clock_start();
 }
 
 #ifdef PROXY
@@ -673,6 +676,8 @@ void memcached_thread_init(int nthreads, void *arg) {
     int         power;
 
     nthreads = upcall_nr_workers();
+    /* The stats loops walk settings.num_threads thread records. */
+    settings.num_threads = nthreads;
 
     for (i = 0; i < POWER_LARGEST; i++) {
         pthread_mutex_init(&lru_locks[i], NULL);

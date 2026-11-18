@@ -873,6 +873,7 @@ void conn_worker_readd(conn *c);
 void clock_start(void);
 struct up_event;
 void read_handler(struct up_event *evt);
+bool read_retry(struct up_event *evt, void (*fn)(struct up_event *));
 void batch_handler(struct up_event *evts, int n);
 void write_handler(struct up_event *evt);
 void udp_read_handler(struct up_event *evt);
